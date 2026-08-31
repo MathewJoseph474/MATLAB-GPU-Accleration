@@ -7,16 +7,10 @@
 slprj/
 codegen/
 
-# Compiled MEX binaries
-*.mexw64
-*.mexa64
-*.mexmaci64
-
 # OS/editor junk
 .DS_Store
 Thumbs.db
 .vscode/
 
-# Project-generated data/results
-database/
+# Generated benchmark results
 results/
