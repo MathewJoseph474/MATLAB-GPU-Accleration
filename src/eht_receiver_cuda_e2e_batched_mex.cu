@@ -95,6 +95,7 @@ constexpr int kSymbolsPerSegment =
 constexpr int kTotalSymbols =
     kNumSegments * kSymbolsPerSegment;
 constexpr int kNumSlots = 4;
+constexpr int kProductionLDPCIterations = 20;
 constexpr int kFFTLength = 4096;
 constexpr int kNumDataSymbols = kNumOFDMSymbols;
 constexpr int kActiveToneCount = 3984;
@@ -255,7 +256,7 @@ struct BatchedSlot {
     float* dCSI = nullptr;
     float* dInverseQuantScale = nullptr;
 
-    int8_t* dExternalLLR = nullptr;
+    float* dExternalLLR = nullptr;
     float* dEncoded = nullptr;
 
     
@@ -323,6 +324,7 @@ SharedDeviceData sharedData;
 Slot slots[kNumSlots];
 bool initialized = false;
 uint64_t nextTicket = 1;
+
 
 void freeSlotResources(Slot& s) {
     if (s.stream && s.occupied)
@@ -546,7 +548,7 @@ void allocateBatchedSlot(
     CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&s.dQuantizedQ),B*size_t(kTotalSymbols)*sizeof(int16_t)));
     CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&s.dCSI),B*size_t(kDataToneCount)*sizeof(float)));
     CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&s.dInverseQuantScale),B*size_t(kNumSegments)*sizeof(float)));
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&s.dExternalLLR),B*size_t(kTotalSymbols)*size_t(kBitsPerSymbol)*sizeof(int8_t)));
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&s.dExternalLLR),B*size_t(kTotalSymbols)*size_t(kBitsPerSymbol)*sizeof(float)));
     CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&s.dEncoded),B*size_t(kEncodedLength)*sizeof(float)));
 
     // LDPC.
@@ -1548,8 +1550,11 @@ __global__ void segmentQuantizeCSIKernel(
         if (symbol == 0) {
             cufftComplex h = channel[activeTone];
             float power = h.x*h.x+h.y*h.y;
-            csiOut[segment*kTonesPerSegment+permutedTone] =
-                power/(power+noiseVariance);
+            // Channel-D fix: preserve channel-power variation for CSI
+            // weighting.  Do not normalize to pw/(pw+noiseVariance),
+            // which collapses the frequency-selective reliability profile
+            // toward one and destroys LDPC soft-information magnitude.
+            csiOut[segment*kTonesPerSegment+permutedTone] = power;
         }
     }
 }
@@ -1907,38 +1912,98 @@ __global__ void equalizeBatchBackendKernel(const cufftComplex* da,const cufftCom
     cufftComplex y{in.x*r.x-in.y*r.y,in.x*r.y+in.y*r.x};auto h=ch[size_t(b)*kActiveToneCount+tone];float d=h.x*h.x+h.y*h.y+nv[b];
     eq[ao+i]={(y.x*h.x+y.y*h.y)/d,(y.y*h.x-y.x*h.y)/d};
 }
-__global__ void segmentQuantizeBatchBackendKernel(const cufftComplex* eq,const cufftComplex* ch,const int* dataIdx,
-    const float* nv,int16_t* io,int16_t* qo,float* csi,float* invq,int batch)
+__global__ void qamFP32BatchBackendKernel(
+    const cufftComplex* eq,
+    const cufftComplex* ch,
+    const int* dataIdx,
+    float* out,
+    float* csi,
+    const float* nv,
+    int batch)
 {
-    int seg=int(blockIdx.x),b=int(blockIdx.y);if(b>=batch)return;__shared__ float pk[256];float lp=0;
-    size_t eo=size_t(b)*kActiveToneCount*kNumDataSymbols,so=size_t(b)*kTotalSymbols,co=size_t(b)*kDataToneCount;
-    for(int l=threadIdx.x;l<kSymbolsPerSegment;l+=blockDim.x){int lt=l%kTonesPerSegment,sym=l/kTonesPerSegment,rt=seg*kTonesPerSegment+lt,at=dataIdx[rt];auto x=eq[eo+sym*kActiveToneCount+at];lp=fmaxf(lp,fmaxf(fabsf(x.x),fabsf(x.y)));}
-    pk[threadIdx.x]=lp;__syncthreads();for(int q=blockDim.x/2;q;q>>=1){if(threadIdx.x<q)pk[threadIdx.x]=fmaxf(pk[threadIdx.x],pk[threadIdx.x+q]);__syncthreads();}
-    float scale=pk[0]==0?1.0f:29490.30078125f/pk[0];if(threadIdx.x==0)invq[size_t(b)*kNumSegments+seg]=1.0f/scale;__syncthreads();
-    for(int ol=threadIdx.x;ol<kSymbolsPerSegment;ol+=blockDim.x){int pt=ol%kTonesPerSegment,sym=ol/kTonesPerSegment,row=pt%49,col=pt/49,raw=col+20*row,rt=seg*kTonesPerSegment+raw,at=dataIdx[rt];auto x=eq[eo+sym*kActiveToneCount+at];int oi=seg*kSymbolsPerSegment+ol;io[so+oi]=matlabRoundInt16(x.x*scale);qo[so+oi]=matlabRoundInt16(x.y*scale);if(sym==0){auto h=ch[size_t(b)*kActiveToneCount+at];float pw=h.x*h.x+h.y*h.y;csi[co+seg*kTonesPerSegment+pt]=pw/(pw+nv[b]);}}
-}
-__global__ void qamBatchBackendKernel(const int16_t* ii,const int16_t* qq,int8_t* out,const float* invq,const float* nv,float ls,int batch)
-{
-    int lin=int(blockIdx.x)*blockDim.x+threadIdx.x;int total=batch*kTotalSymbols;if(lin>=total)return;int b=lin/kTotalSymbols,s=lin%kTotalSymbols;
-    constexpr float cn=1.0f/52.24940180716435f;int seg=s/kSymbolsPerSegment;float iq=invq[size_t(b)*kNumSegments+seg],invn=1.0f/nv[b];float samples[2]={float(ii[lin])*iq,float(qq[lin])*iq};
+    int lin=int(blockIdx.x)*blockDim.x+threadIdx.x;
+    int total=batch*kTotalSymbols;
+    if(lin>=total)return;
+
+    int b=lin/kTotalSymbols;
+    int s=lin%kTotalSymbols;
+    int seg=s/kSymbolsPerSegment;
+    int ol=s%kSymbolsPerSegment;
+
+    // Preserve the exact tone permutation previously performed by
+    // segmentQuantizeBatchBackendKernel.
+    int pt=ol%kTonesPerSegment;
+    int sym=ol/kTonesPerSegment;
+    int row=pt%49;
+    int col=pt/49;
+    int raw=col+20*row;
+    int rt=seg*kTonesPerSegment+raw;
+    int at=dataIdx[rt];
+
+    size_t eqOffset =
+        size_t(b)*kActiveToneCount*kNumDataSymbols +
+        size_t(sym)*kActiveToneCount + at;
+
+    cufftComplex x=eq[eqOffset];
+
+    // CSI uses the same mapped data tone as before.
+    if(sym==0) {
+        cufftComplex h=ch[size_t(b)*kActiveToneCount+at];
+        float pw=h.x*h.x+h.y*h.y;
+        csi[size_t(b)*kDataToneCount+seg*kTonesPerSegment+pt]=pw;
+    }
+
+    constexpr float cn=1.0f/52.24940180716435f;
+    float invn=1.0f/nv[b];
+    float samples[2]={x.x,x.y};
     size_t oo=size_t(b)*kTotalSymbols*kBitsPerSymbol;
+
     #pragma unroll
-    for(int ax=0;ax<2;++ax){float sample=samples[ax];
-      for(int bit=0;bit<6;++bit){float m0=FLT_MAX,m1=FLT_MAX;int bp=5-bit;
-        for(int li=0;li<64;++li){int il=-63+2*li;float lv=float(il)*cn,d=sample-lv,dist=d*d;unsigned lab=grayCode((unsigned)li),v=(lab>>bp)&1U;if(v==0)m0=fminf(m0,dist);else m1=fminf(m1,dist);}float llr=(m1-m0)*invn;float sc=nearbyintf(llr*ls);sc=fminf(127.0f,fmaxf(-128.0f,sc));out[oo+size_t(s)*kBitsPerSymbol+ax*6+bit]=(int8_t)sc;}}
+    for(int ax=0;ax<2;++ax) {
+        float sample=samples[ax];
+
+        #pragma unroll
+        for(int bit=0;bit<6;++bit) {
+            float m0=FLT_MAX,m1=FLT_MAX;
+            int bp=5-bit;
+
+            #pragma unroll
+            for(int li=0;li<64;++li) {
+                int il=-63+2*li;
+                float lv=float(il)*cn;
+                float d=sample-lv;
+                float dist=d*d;
+                unsigned lab=grayCode((unsigned)li);
+                unsigned v=(lab>>bp)&1U;
+                if(v==0)m0=fminf(m0,dist);
+                else    m1=fminf(m1,dist);
+            }
+
+            // Full FP32 max-log LLR: no constellation INT16 quantization,
+            // no LLR INT8 quantization/clipping.
+            float llr=(m1-m0)*invn;
+            out[oo+size_t(s)*kBitsPerSymbol+ax*6+bit]=llr;
+        }
+    }
 }
-__global__ void mapWeightBatchBackendKernel(const int8_t* ext,const float* csi,const uint32_t* esi,float invls,float* enc,int batch)
+__global__ void mapWeightBatchBackendKernel(const float* ext,const float* csi,const uint32_t* esi,float invls,float* enc,int batch)
 {
- int lin=int(blockIdx.x)*blockDim.x+threadIdx.x,total=batch*kEncodedLength;if(lin>=total)return;int b=lin/kEncodedLength,i=lin%kEncodedLength;uint32_t src=esi[i];int seg=int(src/kExternalElementsPerSegment),local=int(src%kExternalElementsPerSegment),row=local%(kBitsPerSymbol*kTonesPerSegment),tone=row/kBitsPerSymbol;float v=float(ext[size_t(b)*kTotalSymbols*kBitsPerSymbol+src])*invls;v*=csi[size_t(b)*kDataToneCount+seg*kTonesPerSegment+tone];enc[size_t(b)*kEncodedLength+i]=v;
+ int lin=int(blockIdx.x)*blockDim.x+threadIdx.x,total=batch*kEncodedLength;if(lin>=total)return;int b=lin/kEncodedLength,i=lin%kEncodedLength;uint32_t src=esi[i];int seg=int(src/kExternalElementsPerSegment),local=int(src%kExternalElementsPerSegment),row=local%(kBitsPerSymbol*kTonesPerSegment),tone=row/kBitsPerSymbol;float v=ext[size_t(b)*kTotalSymbols*kBitsPerSymbol+src];v*=csi[size_t(b)*kDataToneCount+seg*kTonesPerSegment+tone];enc[size_t(b)*kEncodedLength+i]=v;
 }
 __global__ void reconstructBatchBackendKernel(const float* enc,const int* pb,const int* pun,const int* rep,float* bel,float* msg,int batch)
 {
  int b=int(blockIdx.z),cw=int(blockIdx.x),bit=int(threadIdx.x)+int(blockIdx.y)*blockDim.x;if(b>=batch||cw>=kNumCodewords||bit>=N)return;int p=pb[cw],sh=K-p,pu=pun[cw],pa=M-pu,off=0;for(int i=0;i<cw;++i)off+=pb[i]+(M-pun[i])+rep[i];float v;if(bit<p)v=enc[size_t(b)*kEncodedLength+off+bit];else if(bit<K)v=SHORTEN_LLR;else if(bit<K+pa)v=enc[size_t(b)*kEncodedLength+off+p+(bit-K)];else v=0;bel[(size_t(b)*kNumCodewords+cw)*N+bit]=v;for(int e=bit;e<EDGES;e+=N)msg[(size_t(b)*kNumCodewords+cw)*EDGES+e]=0;
 }
-__global__ void layeredNMSBatchBackendKernel(float* bel,float* msg,int batch)
+__global__ void layeredNMSBatchBackendKernel(float* bel,float* msg,int batch,int maxIterations)
 {
- int cw=int(blockIdx.x),b=int(blockIdx.y),r=threadIdx.x;if(b>=batch||cw>=kNumCodewords||r>=Z)return;float*L=bel+(size_t(b)*kNumCodewords+cw)*N;float*R=msg+(size_t(b)*kNumCodewords+cw)*EDGES;
- for(int it=0;it<kMaximumIterations;++it){int eo=0;for(int br=0;br<BASE_ROWS;++br){float m1=FLT_MAX,m2=FLT_MAX;int mc=-1,sp=1,ls=eo;for(int bc=0;bc<BASE_COLS;++bc){int shift=int(P[br*BASE_COLS+bc]);if(shift<0)continue;int v=bc*Z+((r+shift)%Z),e=eo*Z+r;float q=L[v]-R[e],ma=fabsf(q);sp*=q<0?-1:1;if(ma<m1){m2=m1;m1=ma;mc=bc;}else if(ma<m2)m2=ma;++eo;}eo=ls;for(int bc=0;bc<BASE_COLS;++bc){int shift=int(P[br*BASE_COLS+bc]);if(shift<0)continue;int v=bc*Z+((r+shift)%Z),e=eo*Z+r;float old=R[e],q=L[v]-old;int os=q<0?-1:1;float ma=bc==mc?m2:m1,nr=kAlpha*ma*float(sp*os);R[e]=nr;L[v]=q+nr;++eo;}__syncthreads();}}
+ // IMPORTANT: launch with exactly Z threads. Every thread in the block must
+ // reach each __syncthreads() below. The old 128-thread launch caused threads
+ // r>=Z to return before the barriers, which is undefined CUDA behavior.
+ int cw=int(blockIdx.x),b=int(blockIdx.y),r=threadIdx.x;
+ if(b>=batch||cw>=kNumCodewords)return;
+ float*L=bel+(size_t(b)*kNumCodewords+cw)*N;
+ float*R=msg+(size_t(b)*kNumCodewords+cw)*EDGES;
+ for(int it=0;it<maxIterations;++it){int eo=0;for(int br=0;br<BASE_ROWS;++br){float m1=FLT_MAX,m2=FLT_MAX;int mc=-1,sp=1,ls=eo;for(int bc=0;bc<BASE_COLS;++bc){int shift=int(P[br*BASE_COLS+bc]);if(shift<0)continue;int v=bc*Z+((r+shift)%Z),e=eo*Z+r;float q=L[v]-R[e],ma=fabsf(q);sp*=q<0?-1:1;if(ma<m1){m2=m1;m1=ma;mc=bc;}else if(ma<m2)m2=ma;++eo;}eo=ls;for(int bc=0;bc<BASE_COLS;++bc){int shift=int(P[br*BASE_COLS+bc]);if(shift<0)continue;int v=bc*Z+((r+shift)%Z),e=eo*Z+r;float old=R[e],q=L[v]-old;int os=q<0?-1:1;float ma=bc==mc?m2:m1,nr=kAlpha*ma*float(sp*os);R[e]=nr;L[v]=q+nr;++eo;}__syncthreads();}}
 }
 __global__ void hardDecisionBatchBackendKernel(const float* bel,const int* pb,int8_t* dec,int batch)
 {
@@ -3569,8 +3634,8 @@ void e2eBatchCommand(int nlhs,mxArray* plhs[],int nrhs,const mxArray* prhs[])
     std::vector<float> inv(batch);for(mwSize b=0;b<batch;++b){double v=mxIsDouble(prhs[3])?mxGetDoubles(prhs[3])[scn==1?0:b]:mxIsSingle(prhs[3])?double(mxGetSingles(prhs[3])[scn==1?0:b]):scalar(prhs[3],"RxScale");if(!(v>0))mexErrMsgIdAndTxt("eht_receiver_cuda_e2e:Input","RxScale must be positive.");inv[b]=float(1.0/v);}
     const mxComplexSingle* hr=mxGetComplexSingles(prhs[5]);std::vector<cufftComplex> tref(2560);double er=0;for(int i=0;i<2560;++i){tref[i]={hr[i].real,hr[i].imag};er+=double(hr[i].real)*hr[i].real+double(hr[i].imag)*hr[i].imag;}float refE=float(er);
     std::vector<int8_t> href(size_t(batch)*kPayloadBits);mwSize rc=mxGetN(prhs[14]);if(mxIsInt8(prhs[14])){const int8_t*p=(const int8_t*)mxGetData(prhs[14]);for(mwSize b=0;b<batch;++b)std::memcpy(href.data()+size_t(b)*kPayloadBits,p+size_t(rc==1?0:b)*kPayloadBits,kPayloadBits);}else{const mxLogical*p=mxGetLogicals(prhs[14]);for(mwSize b=0;b<batch;++b)for(int i=0;i<kPayloadBits;++i)href[size_t(b)*kPayloadBits+i]=p[size_t(rc==1?0:b)*kPayloadBits+i]?1:0;}
-    size_t total=size_t(count)*batch;int16_t *ri=nullptr,*rq=nullptr,*qi=nullptr,*qq=nullptr;cufftComplex *w=nullptr,*tr=nullptr,*lf=nullptr,*df=nullptr,*li=nullptr,*lo=nullptr,*di=nullptr,*doo=nullptr,*la=nullptr,*da=nullptr,*ch=nullptr,*rot=nullptr,*eq=nullptr;float *is=nullptr,*cc=nullptr,*met=nullptr,*fc=nullptr,*nv=nullptr,*csi=nullptr,*invq=nullptr,*enc=nullptr,*bel=nullptr,*msg=nullptr;int *off=nullptr,*corr=nullptr,*fin=nullptr,*den=nullptr;int8_t *ellr=nullptr,*dec=nullptr,*seq=nullptr,*dref=nullptr;unsigned long long*cs=nullptr;unsigned int*be=nullptr;cufftHandle lp=0,dp=0;
-    auto cm=[&](void**p,size_t n){CUDA_CHECK(cudaMalloc(p,n));};cm((void**)&ri,total*sizeof(int16_t));cm((void**)&rq,total*sizeof(int16_t));cm((void**)&w,total*sizeof(cufftComplex));cm((void**)&tr,2560*sizeof(cufftComplex));cm((void**)&is,batch*sizeof(float));cm((void**)&off,batch*sizeof(int));cm((void**)&cc,batch*sizeof(float));cm((void**)&met,size_t(batch)*513*sizeof(float));cm((void**)&corr,batch*sizeof(int));cm((void**)&fin,batch*sizeof(int));cm((void**)&fc,batch*sizeof(float));cm((void**)&nv,batch*sizeof(float));cm((void**)&lf,size_t(batch)*kEHTLTFLength*sizeof(cufftComplex));cm((void**)&df,size_t(batch)*kEHTDataLength*sizeof(cufftComplex));cm((void**)&li,size_t(batch)*kFFTLength*sizeof(cufftComplex));cm((void**)&lo,size_t(batch)*kFFTLength*sizeof(cufftComplex));cm((void**)&di,size_t(batch)*kDataInputCount*sizeof(cufftComplex));cm((void**)&doo,size_t(batch)*kDataInputCount*sizeof(cufftComplex));cm((void**)&la,size_t(batch)*kActiveToneCount*sizeof(cufftComplex));cm((void**)&da,size_t(batch)*kActiveToneCount*kNumDataSymbols*sizeof(cufftComplex));cm((void**)&ch,size_t(batch)*kActiveToneCount*sizeof(cufftComplex));cm((void**)&rot,size_t(batch)*kNumDataSymbols*sizeof(cufftComplex));cm((void**)&eq,size_t(batch)*kActiveToneCount*kNumDataSymbols*sizeof(cufftComplex));cm((void**)&qi,size_t(batch)*kTotalSymbols*sizeof(int16_t));cm((void**)&qq,size_t(batch)*kTotalSymbols*sizeof(int16_t));cm((void**)&csi,size_t(batch)*kDataToneCount*sizeof(float));cm((void**)&invq,size_t(batch)*kNumSegments*sizeof(float));cm((void**)&ellr,size_t(batch)*kTotalSymbols*kBitsPerSymbol*sizeof(int8_t));cm((void**)&enc,size_t(batch)*kEncodedLength*sizeof(float));cm((void**)&bel,size_t(batch)*kNumCodewords*N*sizeof(float));cm((void**)&msg,size_t(batch)*kNumCodewords*EDGES*sizeof(float));cm((void**)&dec,size_t(batch)*kTotalDecodedBits*sizeof(int8_t));cm((void**)&seq,size_t(batch)*2047*sizeof(int8_t));cm((void**)&den,batch*sizeof(int));cm((void**)&dref,size_t(batch)*kPayloadBits*sizeof(int8_t));cm((void**)&cs,batch*sizeof(unsigned long long));cm((void**)&be,batch*sizeof(unsigned int));
+    size_t total=size_t(count)*batch;int16_t *ri=nullptr,*rq=nullptr,*qi=nullptr,*qq=nullptr;cufftComplex *w=nullptr,*tr=nullptr,*lf=nullptr,*df=nullptr,*li=nullptr,*lo=nullptr,*di=nullptr,*doo=nullptr,*la=nullptr,*da=nullptr,*ch=nullptr,*rot=nullptr,*eq=nullptr;float *is=nullptr,*cc=nullptr,*met=nullptr,*fc=nullptr,*nv=nullptr,*csi=nullptr,*invq=nullptr,*enc=nullptr,*bel=nullptr,*msg=nullptr;int *off=nullptr,*corr=nullptr,*fin=nullptr,*den=nullptr;float *ellr=nullptr;int8_t *dec=nullptr,*seq=nullptr,*dref=nullptr;unsigned long long*cs=nullptr;unsigned int*be=nullptr;cufftHandle lp=0,dp=0;
+    auto cm=[&](void**p,size_t n){CUDA_CHECK(cudaMalloc(p,n));};cm((void**)&ri,total*sizeof(int16_t));cm((void**)&rq,total*sizeof(int16_t));cm((void**)&w,total*sizeof(cufftComplex));cm((void**)&tr,2560*sizeof(cufftComplex));cm((void**)&is,batch*sizeof(float));cm((void**)&off,batch*sizeof(int));cm((void**)&cc,batch*sizeof(float));cm((void**)&met,size_t(batch)*513*sizeof(float));cm((void**)&corr,batch*sizeof(int));cm((void**)&fin,batch*sizeof(int));cm((void**)&fc,batch*sizeof(float));cm((void**)&nv,batch*sizeof(float));cm((void**)&lf,size_t(batch)*kEHTLTFLength*sizeof(cufftComplex));cm((void**)&df,size_t(batch)*kEHTDataLength*sizeof(cufftComplex));cm((void**)&li,size_t(batch)*kFFTLength*sizeof(cufftComplex));cm((void**)&lo,size_t(batch)*kFFTLength*sizeof(cufftComplex));cm((void**)&di,size_t(batch)*kDataInputCount*sizeof(cufftComplex));cm((void**)&doo,size_t(batch)*kDataInputCount*sizeof(cufftComplex));cm((void**)&la,size_t(batch)*kActiveToneCount*sizeof(cufftComplex));cm((void**)&da,size_t(batch)*kActiveToneCount*kNumDataSymbols*sizeof(cufftComplex));cm((void**)&ch,size_t(batch)*kActiveToneCount*sizeof(cufftComplex));cm((void**)&rot,size_t(batch)*kNumDataSymbols*sizeof(cufftComplex));cm((void**)&eq,size_t(batch)*kActiveToneCount*kNumDataSymbols*sizeof(cufftComplex));cm((void**)&qi,size_t(batch)*kTotalSymbols*sizeof(int16_t));cm((void**)&qq,size_t(batch)*kTotalSymbols*sizeof(int16_t));cm((void**)&csi,size_t(batch)*kDataToneCount*sizeof(float));cm((void**)&invq,size_t(batch)*kNumSegments*sizeof(float));cm((void**)&ellr,size_t(batch)*kTotalSymbols*kBitsPerSymbol*sizeof(float));cm((void**)&enc,size_t(batch)*kEncodedLength*sizeof(float));cm((void**)&bel,size_t(batch)*kNumCodewords*N*sizeof(float));cm((void**)&msg,size_t(batch)*kNumCodewords*EDGES*sizeof(float));cm((void**)&dec,size_t(batch)*kTotalDecodedBits*sizeof(int8_t));cm((void**)&seq,size_t(batch)*2047*sizeof(int8_t));cm((void**)&den,batch*sizeof(int));cm((void**)&dref,size_t(batch)*kPayloadBits*sizeof(int8_t));cm((void**)&cs,batch*sizeof(unsigned long long));cm((void**)&be,batch*sizeof(unsigned int));
     CUDA_CHECK(cudaMemcpy(ri,mxGetData(prhs[1]),total*sizeof(int16_t),cudaMemcpyHostToDevice));CUDA_CHECK(cudaMemcpy(rq,mxGetData(prhs[2]),total*sizeof(int16_t),cudaMemcpyHostToDevice));CUDA_CHECK(cudaMemcpy(tr,tref.data(),2560*sizeof(cufftComplex),cudaMemcpyHostToDevice));CUDA_CHECK(cudaMemcpy(is,inv.data(),batch*sizeof(float),cudaMemcpyHostToDevice));CUDA_CHECK(cudaMemcpy(dref,href.data(),size_t(batch)*kPayloadBits*sizeof(int8_t),cudaMemcpyHostToDevice));std::vector<int> init(batch,int(count));CUDA_CHECK(cudaMemcpy(off,init.data(),batch*sizeof(int),cudaMemcpyHostToDevice));CUDA_CHECK(cudaMemset(cs,0,batch*sizeof(unsigned long long)));CUDA_CHECK(cudaMemset(be,0,batch*sizeof(unsigned int)));
    
    
@@ -3636,12 +3701,278 @@ void e2eBatchCommand(int nlhs,mxArray* plhs[],int nrhs,const mxArray* prhs[])
     extractFieldsBatchKernel<<<eg,th>>>(w,fin,int(count),lf,df,int(batch));
     CUDA_CHECK(cudaGetLastError());
     dim3 gg((kFFTLength+th-1)/th,(unsigned)batch);gatherFFTWindowsBatchKernel<<<gg,th>>>(lf,df,li,di,ltfStart,d0,int(batch));CUDA_CHECK(cudaGetLastError());int n[1]={kFFTLength},emb[1]={kFFTLength};CUFFT_CHECK(cufftPlanMany(&lp,1,n,emb,1,kFFTLength,emb,1,kFFTLength,CUFFT_C2C,int(batch)));CUFFT_CHECK(cufftPlanMany(&dp,1,n,emb,1,kFFTLength,emb,1,kFFTLength,CUFFT_C2C,int(batch)*kNumDataSymbols));CUFFT_CHECK(cufftExecC2C(lp,li,lo,CUFFT_FORWARD));CUFFT_CHECK(cufftExecC2C(dp,di,doo,CUFFT_FORWARD));
-    dim3 ag((kActiveToneCount+th-1)/th,(unsigned)batch);extractActiveBatchBackendKernel<<<ag,th>>>(lo,doo,sharedData.ltfFFTIndices,sharedData.dataFFTIndices,la,da,int(batch));estimateChannelBatchBackendKernel<<<ag,th>>>(la,sharedData.knownLTF,ch,int(batch));pilotRotationBatchBackendKernel<<<int(batch)*kNumDataSymbols,256,256*sizeof(cufftComplex)>>>(da,ch,sharedData.pilotIndices,sharedData.pilotReference,sharedData.pilotCount,rot,int(batch));dim3 eqg((kActiveToneCount*kNumDataSymbols+th-1)/th,(unsigned)batch);equalizeBatchBackendKernel<<<eqg,th>>>(da,ch,rot,nv,eq,int(batch));dim3 sqg(kNumSegments,(unsigned)batch);segmentQuantizeBatchBackendKernel<<<sqg,256>>>(eq,ch,sharedData.dataIndices,nv,qi,qq,csi,invq,int(batch));int bt=int(batch)*kTotalSymbols; qamBatchBackendKernel<<<(bt+th-1)/th,th>>>(qi,qq,ellr,invq,nv,float(llrScale),int(batch));int beN=int(batch)*kEncodedLength;mapWeightBatchBackendKernel<<<(beN+th-1)/th,th>>>(ellr,csi,sharedData.encodedSourceIndex,float(1.0/llrScale),enc,int(batch));dim3 rg(kNumCodewords,(N+th-1)/th,(unsigned)batch);reconstructBatchBackendKernel<<<rg,th>>>(enc,sharedData.payloadBits,sharedData.punctureBits,sharedData.repeatBits,bel,msg,int(batch));dim3 ldg(kNumCodewords,(unsigned)batch);layeredNMSBatchBackendKernel<<<ldg,128>>>(bel,msg,int(batch));dim3 hdg(kNumCodewords,(K+th-1)/th,(unsigned)batch);hardDecisionBatchBackendKernel<<<hdg,th>>>(bel,sharedData.payloadBits,dec,int(batch));deriveScramblerBatchBackendKernel<<<int(batch),1>>>(dec,seq,den,int(batch));dim3 vg((kPayloadBits+th-1)/th,(unsigned)batch);validateBatchBackendKernel<<<vg,th>>>(dec,seq,den,dref,cs,be,int(batch));CUDA_CHECK(cudaGetLastError());CUDA_CHECK(cudaDeviceSynchronize());
-    std::vector<unsigned long long> hcs(batch);std::vector<unsigned int> hbe(batch);CUDA_CHECK(cudaMemcpy(hcs.data(),cs,batch*sizeof(unsigned long long),cudaMemcpyDeviceToHost));CUDA_CHECK(cudaMemcpy(hbe.data(),be,batch*sizeof(unsigned int),cudaMemcpyDeviceToHost));
-    const char* fs[]={"BatchSize","PacketsProcessed","TotalBitErrors","FailedPackets","Checksums","BitErrorsPerPacket","PacketErrorsPerPacket","ReturnedBulkOutputBytes","Pass"};mxArray*out=mxCreateStructMatrix(1,1,9,fs);mxArray*mc=mxCreateDoubleMatrix(batch,1,mxREAL),*mb=mxCreateDoubleMatrix(batch,1,mxREAL),*mp=mxCreateDoubleMatrix(batch,1,mxREAL);double*pc=mxGetPr(mc),*pb=mxGetPr(mb),*pp=mxGetPr(mp);double tbe=0,fail=0;for(mwSize b=0;b<batch;++b){pc[b]=double(hcs[b]);pb[b]=double(hbe[b]);pp[b]=hbe[b]?1.0:0.0;tbe+=hbe[b];fail+=pp[b];}mxSetField(out,0,"BatchSize",mxCreateDoubleScalar(double(batch)));mxSetField(out,0,"PacketsProcessed",mxCreateDoubleScalar(double(batch)));mxSetField(out,0,"TotalBitErrors",mxCreateDoubleScalar(tbe));mxSetField(out,0,"FailedPackets",mxCreateDoubleScalar(fail));mxSetField(out,0,"Checksums",mc);mxSetField(out,0,"BitErrorsPerPacket",mb);mxSetField(out,0,"PacketErrorsPerPacket",mp);mxSetField(out,0,"ReturnedBulkOutputBytes",mxCreateDoubleScalar(0));mxSetField(out,0,"Pass",mxCreateLogicalScalar(tbe==0&&fail==0));
+    dim3 ag((kActiveToneCount+th-1)/th,(unsigned)batch);extractActiveBatchBackendKernel<<<ag,th>>>(lo,doo,sharedData.ltfFFTIndices,sharedData.dataFFTIndices,la,da,int(batch));estimateChannelBatchBackendKernel<<<ag,th>>>(la,sharedData.knownLTF,ch,int(batch));pilotRotationBatchBackendKernel<<<int(batch)*kNumDataSymbols,256,256*sizeof(cufftComplex)>>>(da,ch,sharedData.pilotIndices,sharedData.pilotReference,sharedData.pilotCount,rot,int(batch));dim3 eqg((kActiveToneCount*kNumDataSymbols+th-1)/th,(unsigned)batch);equalizeBatchBackendKernel<<<eqg,th>>>(da,ch,rot,nv,eq,int(batch));int bt=int(batch)*kTotalSymbols; qamFP32BatchBackendKernel<<<(bt+th-1)/th,th>>>(eq,ch,sharedData.dataIndices,ellr,csi,nv,int(batch));int beN=int(batch)*kEncodedLength;mapWeightBatchBackendKernel<<<(beN+th-1)/th,th>>>(ellr,csi,sharedData.encodedSourceIndex,float(1.0/llrScale),enc,int(batch));dim3 rg(kNumCodewords,(N+th-1)/th,(unsigned)batch);reconstructBatchBackendKernel<<<rg,th>>>(enc,sharedData.payloadBits,sharedData.punctureBits,sharedData.repeatBits,bel,msg,int(batch));dim3 ldg(kNumCodewords,(unsigned)batch);layeredNMSBatchBackendKernel<<<ldg,Z>>>(bel,msg,int(batch),kProductionLDPCIterations);dim3 hdg(kNumCodewords,(K+th-1)/th,(unsigned)batch);hardDecisionBatchBackendKernel<<<hdg,th>>>(bel,sharedData.payloadBits,dec,int(batch));deriveScramblerBatchBackendKernel<<<int(batch),1>>>(dec,seq,den,int(batch));dim3 vg((kPayloadBits+th-1)/th,(unsigned)batch);validateBatchBackendKernel<<<vg,th>>>(dec,seq,den,dref,cs,be,int(batch));CUDA_CHECK(cudaGetLastError());CUDA_CHECK(cudaDeviceSynchronize());
+    // Validation outputs. In addition to decoded-bit statistics, copy the
+    // front-end synchronization state, the per-tone EHT-LTF channel estimate,
+    // and the equalized active tones to MATLAB. These bulk arrays are returned
+    // only by the validation command e2eBatch; the timed e2eBatchRun/Submit
+    // paths remain unchanged.
+    std::vector<unsigned long long> hcs(batch);
+    std::vector<unsigned int> hbe(batch);
+    std::vector<int> hoff(batch), hfin(batch);
+    std::vector<float> hcc(batch), hfc(batch), hnv(batch);
+    std::vector<cufftComplex> hch(size_t(batch)*kActiveToneCount);
+    std::vector<cufftComplex> heq(size_t(batch)*kActiveToneCount*kNumDataSymbols);
+    std::vector<float> hcsi(size_t(batch)*kDataToneCount);
+    std::vector<float> henc(size_t(batch)*kEncodedLength);
+
+    CUDA_CHECK(cudaMemcpy(hcs.data(),cs,batch*sizeof(unsigned long long),cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(hbe.data(),be,batch*sizeof(unsigned int),cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(hoff.data(),off,batch*sizeof(int),cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(hfin.data(),fin,batch*sizeof(int),cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(hcc.data(),cc,batch*sizeof(float),cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(hfc.data(),fc,batch*sizeof(float),cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(hnv.data(),nv,batch*sizeof(float),cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(hch.data(),ch,hch.size()*sizeof(cufftComplex),cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(heq.data(),eq,heq.size()*sizeof(cufftComplex),cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(hcsi.data(),csi,hcsi.size()*sizeof(float),cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(henc.data(),enc,henc.size()*sizeof(float),cudaMemcpyDeviceToHost));
+
+    const char* fs[]={
+        "BatchSize","PacketsProcessed","TotalBitErrors","FailedPackets",
+        "Checksums","BitErrorsPerPacket","PacketErrorsPerPacket",
+        "CoarseOffsets","FinalOffsets","CoarseCFOHz","FineCFOHz",
+        "NoiseVariance","ChannelEstimate","EqualizedActive",
+        "CSIWeights","EncodedLLR",
+        "ReturnedBulkOutputBytes","Pass"};
+    mxArray*out=mxCreateStructMatrix(1,1,18,fs);
+
+    mxArray*mc=mxCreateDoubleMatrix(batch,1,mxREAL);
+    mxArray*mb=mxCreateDoubleMatrix(batch,1,mxREAL);
+    mxArray*mp=mxCreateDoubleMatrix(batch,1,mxREAL);
+    mxArray*moff=mxCreateDoubleMatrix(batch,1,mxREAL);
+    mxArray*mfin=mxCreateDoubleMatrix(batch,1,mxREAL);
+    mxArray*mcc=mxCreateDoubleMatrix(batch,1,mxREAL);
+    mxArray*mfc=mxCreateDoubleMatrix(batch,1,mxREAL);
+    mxArray*mnv=mxCreateDoubleMatrix(batch,1,mxREAL);
+
+    double*pc=mxGetPr(mc);
+    double*pb=mxGetPr(mb);
+    double*pp=mxGetPr(mp);
+    double*po=mxGetPr(moff);
+    double*pf=mxGetPr(mfin);
+    double*pcc=mxGetPr(mcc);
+    double*pfc=mxGetPr(mfc);
+    double*pnv=mxGetPr(mnv);
+
+    double tbe=0,fail=0;
+    for(mwSize b=0;b<batch;++b){
+        pc[b]=double(hcs[b]);
+        pb[b]=double(hbe[b]);
+        pp[b]=hbe[b]?1.0:0.0;
+        po[b]=double(hoff[b]);
+        pf[b]=double(hfin[b]);
+        pcc[b]=double(hcc[b]);
+        pfc[b]=double(hfc[b]);
+        pnv[b]=double(hnv[b]);
+        tbe+=hbe[b];
+        fail+=pp[b];
+    }
+
+    // GPU memory is laid out tone-fastest, then OFDM symbol, then packet.
+    // MATLAB column-major arrays with dimensions [tone x symbol x packet]
+    // therefore have exactly the same linear order.
+    mwSize chDims[2]={mwSize(kActiveToneCount),batch};
+    mxArray*mch=mxCreateNumericArray(2,chDims,mxSINGLE_CLASS,mxCOMPLEX);
+    mxComplexSingle*pch=mxGetComplexSingles(mch);
+    for(size_t i=0;i<hch.size();++i){
+        pch[i].real=hch[i].x;
+        pch[i].imag=hch[i].y;
+    }
+
+    mwSize eqDims[3]={mwSize(kActiveToneCount),mwSize(kNumDataSymbols),batch};
+    mxArray*meq=mxCreateNumericArray(3,eqDims,mxSINGLE_CLASS,mxCOMPLEX);
+    mxComplexSingle*peq=mxGetComplexSingles(meq);
+    for(size_t i=0;i<heq.size();++i){
+        peq[i].real=heq[i].x;
+        peq[i].imag=heq[i].y;
+    }
+
+    mxSetField(out,0,"BatchSize",mxCreateDoubleScalar(double(batch)));
+    mxSetField(out,0,"PacketsProcessed",mxCreateDoubleScalar(double(batch)));
+    mxSetField(out,0,"TotalBitErrors",mxCreateDoubleScalar(tbe));
+    mxSetField(out,0,"FailedPackets",mxCreateDoubleScalar(fail));
+    mxSetField(out,0,"Checksums",mc);
+    mxSetField(out,0,"BitErrorsPerPacket",mb);
+    mxSetField(out,0,"PacketErrorsPerPacket",mp);
+    mxSetField(out,0,"CoarseOffsets",moff);
+    mxSetField(out,0,"FinalOffsets",mfin);
+    mxSetField(out,0,"CoarseCFOHz",mcc);
+    mxSetField(out,0,"FineCFOHz",mfc);
+    mxSetField(out,0,"NoiseVariance",mnv);
+    mxSetField(out,0,"ChannelEstimate",mch);
+    mxSetField(out,0,"EqualizedActive",meq);
+
+    // CSIWeights: [3920 data tones x packet].
+    mwSize csiDims[2]={mwSize(kDataToneCount),batch};
+    mxArray*mcsi=mxCreateNumericArray(2,csiDims,mxSINGLE_CLASS,mxREAL);
+    std::memcpy(mxGetSingles(mcsi),hcsi.data(),hcsi.size()*sizeof(float));
+    mxSetField(out,0,"CSIWeights",mcsi);
+
+    // EncodedLLR: post-demapper, post-CSI-weighting, post-source-mapping
+    // soft values immediately before LDPC reconstruction.
+    mwSize encDims[2]={mwSize(kEncodedLength),batch};
+    mxArray*menc=mxCreateNumericArray(2,encDims,mxSINGLE_CLASS,mxREAL);
+    std::memcpy(mxGetSingles(menc),henc.data(),henc.size()*sizeof(float));
+    mxSetField(out,0,"EncodedLLR",menc);
+
+    mxSetField(out,0,"ReturnedBulkOutputBytes",
+        mxCreateDoubleScalar(double(
+            (hch.size()+heq.size())*sizeof(cufftComplex) +
+            (hcsi.size()+henc.size())*sizeof(float))));
+    mxSetField(out,0,"Pass",mxCreateLogicalScalar(tbe==0&&fail==0));
     if(lp)cufftDestroy(lp);if(dp)cufftDestroy(dp);cudaFree(be);cudaFree(cs);cudaFree(dref);cudaFree(den);cudaFree(seq);cudaFree(dec);cudaFree(msg);cudaFree(bel);cudaFree(enc);cudaFree(ellr);cudaFree(invq);cudaFree(csi);cudaFree(qq);cudaFree(qi);cudaFree(eq);cudaFree(rot);cudaFree(ch);cudaFree(da);cudaFree(la);cudaFree(doo);cudaFree(di);cudaFree(lo);cudaFree(li);cudaFree(df);cudaFree(lf);cudaFree(nv);cudaFree(fc);cudaFree(fin);cudaFree(corr);cudaFree(met);cudaFree(cc);cudaFree(off);cudaFree(is);cudaFree(tr);cudaFree(w);cudaFree(rq);cudaFree(ri);if(nlhs==1)plhs[0]=out;else mxDestroyArray(out);
 }
 
+
+
+void ldpcFromEncodedLLRCommand(
+    int nlhs,mxArray* plhs[],int nrhs,const mxArray* prhs[])
+{
+    if(nrhs!=3 && nrhs!=4)
+        mexErrMsgIdAndTxt(
+            "eht_receiver_cuda_e2e:InputCount",
+            "ldpcFromEncodedLLR expects command, encodedLLR, referencePayloadBits[,maxIterations].");
+    if(nlhs>1)
+        mexErrMsgIdAndTxt(
+            "eht_receiver_cuda_e2e:OutputCount",
+            "ldpcFromEncodedLLR returns one validation structure.");
+
+    if(mxIsComplex(prhs[1]) ||
+       !(mxIsSingle(prhs[1]) || mxIsDouble(prhs[1])) ||
+       mxGetM(prhs[1])!=kEncodedLength ||
+       mxGetN(prhs[1])<1)
+        mexErrMsgIdAndTxt(
+            "eht_receiver_cuda_e2e:Input",
+            "encodedLLR must be a real single/double [%d x batch] matrix.",
+            kEncodedLength);
+
+    mwSize batch=mxGetN(prhs[1]);
+
+    int requestedIterations = kProductionLDPCIterations;
+    if(nrhs==4) {
+        double v=scalar(prhs[3],"maxIterations");
+        if(v<1.0 || v>100.0 || std::floor(v)!=v)
+            mexErrMsgIdAndTxt(
+                "eht_receiver_cuda_e2e:Input",
+                "maxIterations must be an integer from 1 to 100.");
+        requestedIterations=int(v);
+    }
+
+    if(mxGetM(prhs[2])!=kPayloadBits ||
+       mxGetN(prhs[2])!=batch ||
+       !(mxIsInt8(prhs[2]) || mxIsLogical(prhs[2])))
+        mexErrMsgIdAndTxt(
+            "eht_receiver_cuda_e2e:Input",
+            "referencePayloadBits must be int8/logical [%d x batch].",
+            kPayloadBits);
+
+    ensureInitialized();
+
+    std::vector<float> henc(size_t(batch)*kEncodedLength);
+    if(mxIsSingle(prhs[1])) {
+        const float* p=mxGetSingles(prhs[1]);
+        std::memcpy(henc.data(),p,henc.size()*sizeof(float));
+    } else {
+        const double* p=mxGetDoubles(prhs[1]);
+        for(size_t i=0;i<henc.size();++i)henc[i]=float(p[i]);
+    }
+
+    std::vector<int8_t> href(size_t(batch)*kPayloadBits);
+    if(mxIsInt8(prhs[2])) {
+        const int8_t* p=(const int8_t*)mxGetData(prhs[2]);
+        std::memcpy(href.data(),p,href.size()*sizeof(int8_t));
+    } else {
+        const mxLogical* p=mxGetLogicals(prhs[2]);
+        for(size_t i=0;i<href.size();++i)href[i]=p[i]?1:0;
+    }
+
+    float *enc=nullptr,*bel=nullptr,*msg=nullptr;
+    int8_t *dec=nullptr,*seq=nullptr,*dref=nullptr;
+    int *den=nullptr;
+    unsigned long long *cs=nullptr;
+    unsigned int *be=nullptr;
+
+    auto cm=[&](void** p,size_t n){CUDA_CHECK(cudaMalloc(p,n));};
+    cm((void**)&enc,henc.size()*sizeof(float));
+    cm((void**)&bel,size_t(batch)*kNumCodewords*N*sizeof(float));
+    cm((void**)&msg,size_t(batch)*kNumCodewords*EDGES*sizeof(float));
+    cm((void**)&dec,size_t(batch)*kTotalDecodedBits*sizeof(int8_t));
+    cm((void**)&seq,size_t(batch)*2047*sizeof(int8_t));
+    cm((void**)&den,batch*sizeof(int));
+    cm((void**)&dref,href.size()*sizeof(int8_t));
+    cm((void**)&cs,batch*sizeof(unsigned long long));
+    cm((void**)&be,batch*sizeof(unsigned int));
+
+    CUDA_CHECK(cudaMemcpy(enc,henc.data(),henc.size()*sizeof(float),cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dref,href.data(),href.size()*sizeof(int8_t),cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemset(cs,0,batch*sizeof(unsigned long long)));
+    CUDA_CHECK(cudaMemset(be,0,batch*sizeof(unsigned int)));
+
+    int th=256;
+    dim3 rg(kNumCodewords,(N+th-1)/th,(unsigned)batch);
+    reconstructBatchBackendKernel<<<rg,th>>>(
+        enc,sharedData.payloadBits,sharedData.punctureBits,
+        sharedData.repeatBits,bel,msg,int(batch));
+
+    dim3 ldg(kNumCodewords,(unsigned)batch);
+    layeredNMSBatchBackendKernel<<<ldg,Z>>>(
+        bel,msg,int(batch),requestedIterations);
+
+    dim3 hdg(kNumCodewords,(K+th-1)/th,(unsigned)batch);
+    hardDecisionBatchBackendKernel<<<hdg,th>>>(
+        bel,sharedData.payloadBits,dec,int(batch));
+
+    deriveScramblerBatchBackendKernel<<<int(batch),1>>>(
+        dec,seq,den,int(batch));
+
+    dim3 vg((kPayloadBits+th-1)/th,(unsigned)batch);
+    validateBatchBackendKernel<<<vg,th>>>(
+        dec,seq,den,dref,cs,be,int(batch));
+
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    std::vector<unsigned long long> hcs(batch);
+    std::vector<unsigned int> hbe(batch);
+    CUDA_CHECK(cudaMemcpy(hcs.data(),cs,batch*sizeof(unsigned long long),cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(hbe.data(),be,batch*sizeof(unsigned int),cudaMemcpyDeviceToHost));
+
+    const char* fs[]={
+        "BatchSize","Iterations","TotalBitErrors","FailedPackets",
+        "Checksums","BitErrorsPerPacket","PacketErrorsPerPacket","Pass"};
+    mxArray* out=mxCreateStructMatrix(1,1,8,fs);
+
+    mxArray* mc=mxCreateDoubleMatrix(batch,1,mxREAL);
+    mxArray* mb=mxCreateDoubleMatrix(batch,1,mxREAL);
+    mxArray* mp=mxCreateDoubleMatrix(batch,1,mxREAL);
+    double* pc=mxGetPr(mc);
+    double* pb=mxGetPr(mb);
+    double* pp=mxGetPr(mp);
+
+    double totalBE=0,failed=0;
+    for(mwSize b=0;b<batch;++b) {
+        pc[b]=double(hcs[b]);
+        pb[b]=double(hbe[b]);
+        pp[b]=hbe[b]?1.0:0.0;
+        totalBE+=double(hbe[b]);
+        failed+=pp[b];
+    }
+
+    mxSetField(out,0,"BatchSize",mxCreateDoubleScalar(double(batch)));
+    mxSetField(out,0,"Iterations",mxCreateDoubleScalar(double(requestedIterations)));
+    mxSetField(out,0,"TotalBitErrors",mxCreateDoubleScalar(totalBE));
+    mxSetField(out,0,"FailedPackets",mxCreateDoubleScalar(failed));
+    mxSetField(out,0,"Checksums",mc);
+    mxSetField(out,0,"BitErrorsPerPacket",mb);
+    mxSetField(out,0,"PacketErrorsPerPacket",mp);
+    mxSetField(out,0,"Pass",mxCreateLogicalScalar(totalBE==0 && failed==0));
+
+    cudaFree(be);cudaFree(cs);cudaFree(dref);cudaFree(den);
+    cudaFree(seq);cudaFree(dec);cudaFree(msg);cudaFree(bel);cudaFree(enc);
+
+    if(nlhs==1)plhs[0]=out;else mxDestroyArray(out);
+}
 
 
 BatchedSlot* findFreeBatchedSlot()
@@ -4033,28 +4364,16 @@ void e2eBatchSubmitCommand(
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaEventRecord(slot->evEqualizationEnd,stream));
 
-    // Stage 8: 4096-QAM Demapping.
-    dim3 sqg(kNumSegments,(unsigned)B);
-    segmentQuantizeBatchBackendKernel<<<sqg,256,0,stream>>>(
+    // Stage 8: 4096-QAM Demapping directly from FP32 equalized symbols.
+    // This removes the final INT16 constellation quantization bottleneck.
+    const int bt = B*kTotalSymbols;
+    qamFP32BatchBackendKernel<<<(bt+th-1)/th,th,0,stream>>>(
         slot->dEqualized,
         slot->dChannelEstimate,
         sharedData.dataIndices,
-        slot->dNoiseVariance,
-        slot->dQuantizedI,
-        slot->dQuantizedQ,
-        slot->dCSI,
-        slot->dInverseQuantScale,
-        B);
-    CUDA_CHECK(cudaGetLastError());
-
-    const int bt = B*kTotalSymbols;
-    qamBatchBackendKernel<<<(bt+th-1)/th,th,0,stream>>>(
-        slot->dQuantizedI,
-        slot->dQuantizedQ,
         slot->dExternalLLR,
-        slot->dInverseQuantScale,
+        slot->dCSI,
         slot->dNoiseVariance,
-        float(llrScale),
         B);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaEventRecord(slot->evQAMDemappingEnd,stream));
@@ -4085,8 +4404,8 @@ void e2eBatchSubmitCommand(
     CUDA_CHECK(cudaGetLastError());
 
     dim3 ldg(kNumCodewords,(unsigned)B);
-    layeredNMSBatchBackendKernel<<<ldg,128,0,stream>>>(
-        slot->dBeliefs,slot->dMessages,B);
+    layeredNMSBatchBackendKernel<<<ldg,Z,0,stream>>>(
+        slot->dBeliefs,slot->dMessages,B,kProductionLDPCIterations);
     CUDA_CHECK(cudaGetLastError());
 
     dim3 hdg(kNumCodewords,(K+th-1)/th,(unsigned)B);
@@ -4360,8 +4679,8 @@ void e2eBatchRunCommand(int nlhs,mxArray* plhs[],int nrhs,const mxArray* prhs[])
     ensureInitialized();initializeFrontendMetadata(prhs[6],prhs[7],prhs[10],prhs[11],prhs[12],prhs[13]);
     std::vector<float> inv(batch);for(mwSize b=0;b<batch;++b){double v=mxIsDouble(prhs[3])?mxGetDoubles(prhs[3])[scn==1?0:b]:mxIsSingle(prhs[3])?double(mxGetSingles(prhs[3])[scn==1?0:b]):scalar(prhs[3],"RxScale");if(!(v>0))mexErrMsgIdAndTxt("eht_receiver_cuda_e2e:Input","RxScale must be positive.");inv[b]=float(1.0/v);}
     const mxComplexSingle* hr=mxGetComplexSingles(prhs[5]);std::vector<cufftComplex> tref(2560);double er=0;for(int i=0;i<2560;++i){tref[i]={hr[i].real,hr[i].imag};er+=double(hr[i].real)*hr[i].real+double(hr[i].imag)*hr[i].imag;}float refE=float(er);
-    size_t total=size_t(count)*batch;int16_t *ri=nullptr,*rq=nullptr,*qi=nullptr,*qq=nullptr;cufftComplex *w=nullptr,*tr=nullptr,*lf=nullptr,*df=nullptr,*li=nullptr,*lo=nullptr,*di=nullptr,*doo=nullptr,*la=nullptr,*da=nullptr,*ch=nullptr,*rot=nullptr,*eq=nullptr;float *is=nullptr,*cc=nullptr,*met=nullptr,*fc=nullptr,*nv=nullptr,*csi=nullptr,*invq=nullptr,*enc=nullptr,*bel=nullptr,*msg=nullptr;int *off=nullptr,*corr=nullptr,*fin=nullptr,*den=nullptr;int8_t *ellr=nullptr,*dec=nullptr,*seq=nullptr,*descr=nullptr;unsigned long long*cs=nullptr;cufftHandle lp=0,dp=0;
-    auto cm=[&](void**p,size_t n){CUDA_CHECK(cudaMalloc(p,n));};cm((void**)&ri,total*sizeof(int16_t));cm((void**)&rq,total*sizeof(int16_t));cm((void**)&w,total*sizeof(cufftComplex));cm((void**)&tr,2560*sizeof(cufftComplex));cm((void**)&is,batch*sizeof(float));cm((void**)&off,batch*sizeof(int));cm((void**)&cc,batch*sizeof(float));cm((void**)&met,size_t(batch)*513*sizeof(float));cm((void**)&corr,batch*sizeof(int));cm((void**)&fin,batch*sizeof(int));cm((void**)&fc,batch*sizeof(float));cm((void**)&nv,batch*sizeof(float));cm((void**)&lf,size_t(batch)*kEHTLTFLength*sizeof(cufftComplex));cm((void**)&df,size_t(batch)*kEHTDataLength*sizeof(cufftComplex));cm((void**)&li,size_t(batch)*kFFTLength*sizeof(cufftComplex));cm((void**)&lo,size_t(batch)*kFFTLength*sizeof(cufftComplex));cm((void**)&di,size_t(batch)*kDataInputCount*sizeof(cufftComplex));cm((void**)&doo,size_t(batch)*kDataInputCount*sizeof(cufftComplex));cm((void**)&la,size_t(batch)*kActiveToneCount*sizeof(cufftComplex));cm((void**)&da,size_t(batch)*kActiveToneCount*kNumDataSymbols*sizeof(cufftComplex));cm((void**)&ch,size_t(batch)*kActiveToneCount*sizeof(cufftComplex));cm((void**)&rot,size_t(batch)*kNumDataSymbols*sizeof(cufftComplex));cm((void**)&eq,size_t(batch)*kActiveToneCount*kNumDataSymbols*sizeof(cufftComplex));cm((void**)&qi,size_t(batch)*kTotalSymbols*sizeof(int16_t));cm((void**)&qq,size_t(batch)*kTotalSymbols*sizeof(int16_t));cm((void**)&csi,size_t(batch)*kDataToneCount*sizeof(float));cm((void**)&invq,size_t(batch)*kNumSegments*sizeof(float));cm((void**)&ellr,size_t(batch)*kTotalSymbols*kBitsPerSymbol*sizeof(int8_t));cm((void**)&enc,size_t(batch)*kEncodedLength*sizeof(float));cm((void**)&bel,size_t(batch)*kNumCodewords*N*sizeof(float));cm((void**)&msg,size_t(batch)*kNumCodewords*EDGES*sizeof(float));cm((void**)&dec,size_t(batch)*kTotalDecodedBits*sizeof(int8_t));cm((void**)&seq,size_t(batch)*2047*sizeof(int8_t));cm((void**)&descr,size_t(batch)*kTotalDecodedBits*sizeof(int8_t));cm((void**)&den,batch*sizeof(int));cm((void**)&cs,batch*sizeof(unsigned long long));
+    size_t total=size_t(count)*batch;int16_t *ri=nullptr,*rq=nullptr,*qi=nullptr,*qq=nullptr;cufftComplex *w=nullptr,*tr=nullptr,*lf=nullptr,*df=nullptr,*li=nullptr,*lo=nullptr,*di=nullptr,*doo=nullptr,*la=nullptr,*da=nullptr,*ch=nullptr,*rot=nullptr,*eq=nullptr;float *is=nullptr,*cc=nullptr,*met=nullptr,*fc=nullptr,*nv=nullptr,*csi=nullptr,*invq=nullptr,*enc=nullptr,*bel=nullptr,*msg=nullptr;int *off=nullptr,*corr=nullptr,*fin=nullptr,*den=nullptr;float *ellr=nullptr;int8_t *dec=nullptr,*seq=nullptr,*descr=nullptr;unsigned long long*cs=nullptr;cufftHandle lp=0,dp=0;
+    auto cm=[&](void**p,size_t n){CUDA_CHECK(cudaMalloc(p,n));};cm((void**)&ri,total*sizeof(int16_t));cm((void**)&rq,total*sizeof(int16_t));cm((void**)&w,total*sizeof(cufftComplex));cm((void**)&tr,2560*sizeof(cufftComplex));cm((void**)&is,batch*sizeof(float));cm((void**)&off,batch*sizeof(int));cm((void**)&cc,batch*sizeof(float));cm((void**)&met,size_t(batch)*513*sizeof(float));cm((void**)&corr,batch*sizeof(int));cm((void**)&fin,batch*sizeof(int));cm((void**)&fc,batch*sizeof(float));cm((void**)&nv,batch*sizeof(float));cm((void**)&lf,size_t(batch)*kEHTLTFLength*sizeof(cufftComplex));cm((void**)&df,size_t(batch)*kEHTDataLength*sizeof(cufftComplex));cm((void**)&li,size_t(batch)*kFFTLength*sizeof(cufftComplex));cm((void**)&lo,size_t(batch)*kFFTLength*sizeof(cufftComplex));cm((void**)&di,size_t(batch)*kDataInputCount*sizeof(cufftComplex));cm((void**)&doo,size_t(batch)*kDataInputCount*sizeof(cufftComplex));cm((void**)&la,size_t(batch)*kActiveToneCount*sizeof(cufftComplex));cm((void**)&da,size_t(batch)*kActiveToneCount*kNumDataSymbols*sizeof(cufftComplex));cm((void**)&ch,size_t(batch)*kActiveToneCount*sizeof(cufftComplex));cm((void**)&rot,size_t(batch)*kNumDataSymbols*sizeof(cufftComplex));cm((void**)&eq,size_t(batch)*kActiveToneCount*kNumDataSymbols*sizeof(cufftComplex));cm((void**)&qi,size_t(batch)*kTotalSymbols*sizeof(int16_t));cm((void**)&qq,size_t(batch)*kTotalSymbols*sizeof(int16_t));cm((void**)&csi,size_t(batch)*kDataToneCount*sizeof(float));cm((void**)&invq,size_t(batch)*kNumSegments*sizeof(float));cm((void**)&ellr,size_t(batch)*kTotalSymbols*kBitsPerSymbol*sizeof(float));cm((void**)&enc,size_t(batch)*kEncodedLength*sizeof(float));cm((void**)&bel,size_t(batch)*kNumCodewords*N*sizeof(float));cm((void**)&msg,size_t(batch)*kNumCodewords*EDGES*sizeof(float));cm((void**)&dec,size_t(batch)*kTotalDecodedBits*sizeof(int8_t));cm((void**)&seq,size_t(batch)*2047*sizeof(int8_t));cm((void**)&descr,size_t(batch)*kTotalDecodedBits*sizeof(int8_t));cm((void**)&den,batch*sizeof(int));cm((void**)&cs,batch*sizeof(unsigned long long));
     CUDA_CHECK(cudaMemcpy(ri,mxGetData(prhs[1]),total*sizeof(int16_t),cudaMemcpyHostToDevice));CUDA_CHECK(cudaMemcpy(rq,mxGetData(prhs[2]),total*sizeof(int16_t),cudaMemcpyHostToDevice));CUDA_CHECK(cudaMemcpy(tr,tref.data(),2560*sizeof(cufftComplex),cudaMemcpyHostToDevice));CUDA_CHECK(cudaMemcpy(is,inv.data(),batch*sizeof(float),cudaMemcpyHostToDevice));std::vector<int> init(batch,int(count));CUDA_CHECK(cudaMemcpy(off,init.data(),batch*sizeof(int),cudaMemcpyHostToDevice));CUDA_CHECK(cudaMemset(cs,0,batch*sizeof(unsigned long long)));
     
     
@@ -4467,14 +4786,10 @@ void e2eBatchRunCommand(int nlhs,mxArray* plhs[],int nrhs,const mxArray* prhs[])
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaEventRecord(evEqualizationEnd));
 
-    // Stage 8: 4096-QAM Demapping. The segment-quantization kernel is the
-    // GPU-side preparation of equalized constellation samples consumed by
-    // the soft 4096-QAM demapper, so it is included in this stage.
-    dim3 sqg(kNumSegments,(unsigned)batch);
-    segmentQuantizeBatchBackendKernel<<<sqg,256>>>(eq,ch,sharedData.dataIndices,nv,qi,qq,csi,invq,int(batch));
-    CUDA_CHECK(cudaGetLastError());
+    // Stage 8: 4096-QAM Demapping directly from FP32 equalized symbols.
     int bt=int(batch)*kTotalSymbols;
-    qamBatchBackendKernel<<<(bt+th-1)/th,th>>>(qi,qq,ellr,invq,nv,float(llrScale),int(batch));
+    qamFP32BatchBackendKernel<<<(bt+th-1)/th,th>>>(
+        eq,ch,sharedData.dataIndices,ellr,csi,nv,int(batch));
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaEventRecord(evQAMDemappingEnd));
 
@@ -4491,7 +4806,7 @@ void e2eBatchRunCommand(int nlhs,mxArray* plhs[],int nrhs,const mxArray* prhs[])
     reconstructBatchBackendKernel<<<rg,th>>>(enc,sharedData.payloadBits,sharedData.punctureBits,sharedData.repeatBits,bel,msg,int(batch));
     CUDA_CHECK(cudaGetLastError());
     dim3 ldg(kNumCodewords,(unsigned)batch);
-    layeredNMSBatchBackendKernel<<<ldg,128>>>(bel,msg,int(batch));
+    layeredNMSBatchBackendKernel<<<ldg,Z>>>(bel,msg,int(batch),kProductionLDPCIterations);
     CUDA_CHECK(cudaGetLastError());
     dim3 hdg(kNumCodewords,(K+th-1)/th,(unsigned)batch);
     hardDecisionBatchBackendKernel<<<hdg,th>>>(bel,sharedData.payloadBits,dec,int(batch));
@@ -5084,6 +5399,7 @@ void resetCommand() {
     }
 }
 
+
 } // namespace
 
 void mexFunction(
@@ -5112,6 +5428,8 @@ void mexFunction(
         e2eCommand(nlhs,plhs,nrhs,prhs);
     } else if (command == "batchFrontend") {
         batchFrontendCommand(nlhs,plhs,nrhs,prhs);
+    } else if (command == "ldpcFromEncodedLLR") {
+        ldpcFromEncodedLLRCommand(nlhs,plhs,nrhs,prhs);
     } else if (command == "e2eBatch") {
         e2eBatchCommand(nlhs,plhs,nrhs,prhs);
     } else if (command == "e2eBatchPrepare") {

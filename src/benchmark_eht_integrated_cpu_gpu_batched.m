@@ -131,17 +131,259 @@ else
 end
 
 %% Small correctness validation outside timing
+% Channel-D correctness validation:
+%   1) Decode the same packet set through the MATLAB CPU receiver.
+%   2) Decode those packets through the CUDA GPU receiver.
+%   3) Print one compact pass/fail summary before timed benchmarking.
+% Detailed packet diagnostics are printed only when validation fails.
+
 validationCount = min(double(opts.ValidationPackets),numPackets);
+
 if validationCount > 0
+
     idx = sourceMap(1:validationCount);
+
+    %% -------------------------------------------------------------
+    % CPU correctness validation
+    % --------------------------------------------------------------
+    cpuValidationBitErrors = zeros(validationCount,1);
+    cpuValidationPacketErrors = zeros(validationCount,1);
+
+    for k = 1:validationCount
+
+        sourceIndex = idx(k);
+
+        [rxSync,~,~,noiseVar,~] = synchronizePacketLocal( ...
+            database.RxI(:,sourceIndex), ...
+            database.RxQ(:,sourceIndex), ...
+            database.RxScale(sourceIndex), ...
+            cfgEHT,sampleRate,fieldIndices, ...
+            packetLengthSamples,channelBandwidth);
+
+        [cpuBits,~] = recoverCPUFromSynchronizedLocal( ...
+            rxSync,noiseVar,cfgEHT,fieldIndices);
+
+        referenceBits = int8( ...
+            database.TxBits(1:payloadBitsPerPacket,sourceIndex));
+
+        recoveredBits = int8( ...
+            cpuBits(1:payloadBitsPerPacket));
+
+        cpuValidationBitErrors(k) = ...
+            sum(recoveredBits(:) ~= referenceBits(:));
+
+        cpuValidationPacketErrors(k) = ...
+            cpuValidationBitErrors(k) > 0;
+
+    end
+
+    cpuValidationTotalBitErrors = sum(cpuValidationBitErrors);
+    cpuValidationFailedPackets = sum(cpuValidationPacketErrors);
+
+    %% -------------------------------------------------------------
+    % GPU correctness validation
+    % --------------------------------------------------------------
     refBits = int8(database.TxBits(1:payloadBitsPerPacket,idx));
+
     gpuValidation = eht_receiver_cuda_e2e_batched_mex( ...
-        'e2eBatch',database.RxI(:,idx),database.RxQ(:,idx),database.RxScale(idx), ...
-        opts.LLRScale,lltfReference,ltfFFTIndices,dataFFTIndices,ltfFFTStart, ...
-        dataFFTStarts,knownLTF,pilotIndices,pilotReference,dataIndices,refBits);
-    assert(gpuValidation.TotalBitErrors == 0 && gpuValidation.FailedPackets == 0, ...
-        'GPU validation failed before timed benchmark.');
+        'e2eBatch', ...
+        database.RxI(:,idx), ...
+        database.RxQ(:,idx), ...
+        database.RxScale(idx), ...
+        opts.LLRScale, ...
+        lltfReference, ...
+        ltfFFTIndices, ...
+        dataFFTIndices, ...
+        ltfFFTStart, ...
+        dataFFTStarts, ...
+        knownLTF, ...
+        pilotIndices, ...
+        pilotReference, ...
+        dataIndices, ...
+        refBits);
+
+    %% -------------------------------------------------------------
+    % Channel-D correctness gate
+    % --------------------------------------------------------------
+    % The CUDA CSI path now preserves raw per-tone channel power rather than
+    % compressing CSI to pw/(pw+noiseVariance).  The small CPU/GPU validation
+    % above is sufficient to establish correctness before timed benchmarking.
+
+    fprintf('\n============================================================\n');
+    fprintf('CHANNEL-D RECEIVER VALIDATION (%d packets)\n',validationCount);
+    fprintf('============================================================\n');
+    fprintf('CPU : %d bit errors | %d/%d failed\n', ...
+        cpuValidationTotalBitErrors,cpuValidationFailedPackets,validationCount);
+    fprintf('GPU : %d bit errors | %d/%d failed\n', ...
+        gpuValidation.TotalBitErrors,gpuValidation.FailedPackets,validationCount);
+    fprintf('GPU : FP32 soft path | LDPC 20 iterations | Z=81\n');
+
+    validationPassed = ...
+        cpuValidationTotalBitErrors == 0 && ...
+        cpuValidationFailedPackets == 0 && ...
+        gpuValidation.TotalBitErrors == 0 && ...
+        gpuValidation.FailedPackets == 0;
+
+    if validationPassed
+        fprintf('Result: PASS - proceeding to timed benchmark.\n');
+    else
+        fprintf('Result: FAIL - timed benchmark will not start.\n');
+
+        cpuFailedIdx = find(cpuValidationBitErrors > 0);
+        if ~isempty(cpuFailedIdx)
+            fprintf('CPU failures: ');
+            for q = 1:numel(cpuFailedIdx)
+                kk = cpuFailedIdx(q);
+                fprintf('src %d (%d bits)',idx(kk),cpuValidationBitErrors(kk));
+                if q < numel(cpuFailedIdx), fprintf(', '); end
+            end
+            fprintf('\n');
+        end
+
+        gpuFailedIdx = find(gpuValidation.BitErrorsPerPacket > 0);
+        if ~isempty(gpuFailedIdx)
+            fprintf('GPU failures: ');
+            for q = 1:numel(gpuFailedIdx)
+                kk = gpuFailedIdx(q);
+                fprintf('src %d (%d bits)',idx(kk),gpuValidation.BitErrorsPerPacket(kk));
+                if q < numel(gpuFailedIdx), fprintf(', '); end
+            end
+            fprintf('\n');
+        end
+    end
+    fprintf('============================================================\n\n');
+
+    % Keep the existing safety gate: do not benchmark a receiver that
+    % has already failed correctness validation.
+    assert(cpuValidationTotalBitErrors == 0 && ...
+           cpuValidationFailedPackets == 0, ...
+        'CPU validation failed before timed benchmark.');
+
+    if gpuValidation.TotalBitErrors ~= 0 || ...
+            gpuValidation.FailedPackets ~= 0
+
+        % At this stage the FP32 soft path has already reduced the problem
+        % to a tiny residual failure. Analyze only the worst failing packet
+        % and sweep LDPC iterations using the exact CUDA pre-LDPC vector.
+        [worstBitErrors,worstLocalIndex] = ...
+            max(gpuValidation.BitErrorsPerPacket);
+        worstSourceIndex = idx(worstLocalIndex);
+
+        fprintf('\n============================================================\n');
+        fprintf('TARGETED RESIDUAL FAILURE ANALYSIS\n');
+        fprintf('============================================================\n');
+        fprintf('Worst validation packet : %d (source %d)\n', ...
+            worstLocalIndex,worstSourceIndex);
+        fprintf('GPU bit errors          : %d\n',worstBitErrors);
+
+        cpuDiag = channelDDiagnosticCPULocal( ...
+            database.RxI(:,worstSourceIndex), ...
+            database.RxQ(:,worstSourceIndex), ...
+            database.RxScale(worstSourceIndex), ...
+            cfgEHT,sampleRate,fieldIndices, ...
+            packetLengthSamples,channelBandwidth);
+
+        cpuLLR = double(cpuDiag.EncodedLLR(:));
+        gpuLLR = double(gpuValidation.EncodedLLR(:,worstLocalIndex));
+
+        llrError = gpuLLR-cpuLLR;
+        llrRMSE = sqrt(mean(llrError.^2));
+        llrRelRMSE = llrRMSE / max(sqrt(mean(cpuLLR.^2)),eps);
+
+        activeMask = abs(cpuLLR)>1e-12 | abs(gpuLLR)>1e-12;
+        signMismatch = find(activeMask & (sign(cpuLLR)~=sign(gpuLLR)));
+
+        denom = norm(cpuLLR)*norm(gpuLLR);
+        if denom>0
+            cosineSimilarity = dot(cpuLLR,gpuLLR)/denom;
+        else
+            cosineSimilarity = NaN;
+        end
+
+        fprintf('Pre-LDPC LLR RMSE      : %.9g\n',llrRMSE);
+        fprintf('Pre-LDPC LLR rel RMSE  : %.6f %%\n',100*llrRelRMSE);
+        fprintf('LLR cosine similarity  : %.9f\n',cosineSimilarity);
+        fprintf('LLR sign mismatches    : %d / %d (%.6f %%)\n', ...
+            numel(signMismatch),numel(cpuLLR), ...
+            100*numel(signMismatch)/numel(cpuLLR));
+
+        % Print the 20 largest CPU/GPU LLR disagreements.
+        [~,largestDiffOrder] = sort(abs(llrError),'descend');
+        largestDiffOrder = largestDiffOrder(1:min(20,numel(largestDiffOrder)));
+
+        fprintf('\n20 largest pre-LDPC LLR differences:\n');
+        fprintf(' Index          CPU_LLR          GPU_LLR         AbsDiff   SignSame\n');
+        for q = 1:numel(largestDiffOrder)
+            ii = largestDiffOrder(q);
+            fprintf('%6d  %+14.6e  %+14.6e  %12.6e     %d\n', ...
+                ii,cpuLLR(ii),gpuLLR(ii),abs(llrError(ii)), ...
+                sign(cpuLLR(ii))==sign(gpuLLR(ii)));
+        end
+
+        % Print the 20 weakest CPU soft bits, where small perturbations are
+        % most likely to affect an LDPC decision.
+        [~,weakOrder] = sort(abs(cpuLLR),'ascend');
+        weakOrder = weakOrder(1:min(20,numel(weakOrder)));
+
+        fprintf('\n20 weakest MATLAB pre-LDPC soft bits:\n');
+        fprintf(' Index          CPU_LLR          GPU_LLR         AbsDiff   SignSame\n');
+        for q = 1:numel(weakOrder)
+            ii = weakOrder(q);
+            fprintf('%6d  %+14.6e  %+14.6e  %12.6e     %d\n', ...
+                ii,cpuLLR(ii),gpuLLR(ii),abs(llrError(ii)), ...
+                sign(cpuLLR(ii))==sign(gpuLLR(ii)));
+        end
+
+        %% GPU LDPC iteration sweep using the exact GPU pre-LDPC vector.
+        fprintf('\n------------------------------------------------------------\n');
+        fprintf('GPU LDPC ITERATION SWEEP ON WORST PACKET\n');
+        fprintf('------------------------------------------------------------\n');
+
+        refBitsWorst = int8(database.TxBits( ...
+            1:payloadBitsPerPacket,worstSourceIndex));
+
+        iterationSweep = [12 16 20 24 32];
+        iterationErrors = zeros(size(iterationSweep));
+
+        for q = 1:numel(iterationSweep)
+            iso = eht_receiver_cuda_e2e_batched_mex( ...
+                'ldpcFromEncodedLLR', ...
+                single(gpuLLR), ...
+                refBitsWorst, ...
+                iterationSweep(q));
+
+            iterationErrors(q) = iso.TotalBitErrors;
+
+            fprintf('%2d iterations : %d bit errors\n', ...
+                iterationSweep(q),iso.TotalBitErrors);
+        end
+
+        firstPassing = find(iterationErrors==0,1,'first');
+
+        fprintf('------------------------------------------------------------\n');
+        if ~isempty(firstPassing)
+            fprintf(['RESULT: the CUDA soft vector is decodable; packet %d ' ...
+                'reaches zero errors at %d LDPC iterations.\n'], ...
+                worstSourceIndex,iterationSweep(firstPassing));
+            fprintf(['NEXT ACTION: use %d iterations for production validation ' ...
+                'and measure its performance cost.\n'], ...
+                iterationSweep(firstPassing));
+        else
+            fprintf(['RESULT: packet %d still fails through 32 iterations.\n'], ...
+                worstSourceIndex);
+            fprintf(['NEXT ACTION: iterations are not the solution; match the ' ...
+                'remaining CUDA-vs-MATLAB LLR magnitude behavior.\n']);
+        end
+        fprintf('============================================================\n\n');
+
+        error('wifi7cuda:GPUValidationFailure', ...
+            ['GPU validation still has a residual error. Packet-targeted LLR ' ...
+             'comparison and LDPC iteration sweep are printed above; timed ' ...
+             'benchmark was not started.']);
+    end
+
 end
+
 
 %% Warm-up run which isoutside timing
 warmCount = min(double(opts.WarmupPackets),numPackets);
@@ -750,6 +992,178 @@ stageTiming.LDPCDecoding_s = postTiming.ChannelDecode_s;
 stageTiming.Descrambling_s = postTiming.Descramble_s;
 stageTiming.PayloadRecovery_s = postTiming.FinalBitExtraction_s;
 end
+
+function diag = channelDDiagnosticCPULocal( ...
+        rxI,rxQ,rxScale,cfgEHT,sampleRate,fieldIndices, ...
+        packetLengthSamples,channelBandwidth)
+%CHANNELDDIAGNOSTICCPULOCAL Reference MATLAB Stage 1-7 diagnostic.
+% Repeats the validated CPU synchronization, EHT-LTF channel estimation,
+% pilot tracking, and equalization while returning intermediate values for
+% comparison against the CUDA validation command. This function is outside
+% all timed benchmark regions.
+
+    rxWaveform = complex(single(rxI),single(rxQ))./single(rxScale);
+
+    %% 1. Packet detection
+    coarsePacketOffset = wlanPacketDetect(rxWaveform,channelBandwidth);
+    if isempty(coarsePacketOffset)
+        error('wifi7cuda:PacketDetectionFailure', ...
+            'Packet detection failed in Channel-D diagnostic.');
+    end
+
+    rxDetected = rxWaveform(coarsePacketOffset+1:end,:);
+    rxLSTF = rxDetected(fieldIndices.LSTF(1):fieldIndices.LSTF(2),:);
+
+    %% 2. Coarse CFO
+    coarseCFOHz = wlanCoarseCFOEstimate(rxLSTF,channelBandwidth);
+    rxCoarseCorrected = applyFrequencyOffsetLocal( ...
+        rxDetected,sampleRate,-coarseCFOHz);
+
+    %% 3. Timing synchronization
+    legacyPreamble = rxCoarseCorrected( ...
+        fieldIndices.LSTF(1):fieldIndices.LSIG(2),:);
+    fineTimingOffset = wlanSymbolTimingEstimate( ...
+        legacyPreamble,channelBandwidth);
+    finalPacketOffset = coarsePacketOffset+fineTimingOffset;
+
+    rxTimed = rxWaveform(finalPacketOffset+1:end,:);
+    if size(rxTimed,1) < packetLengthSamples
+        error('wifi7cuda:InsufficientSamples', ...
+            'Insufficient samples in Channel-D CPU diagnostic.');
+    end
+    rxTimed = rxTimed(1:packetLengthSamples,:);
+
+    % Match the existing receiver's second coarse-CFO correction.
+    rxTimed = applyFrequencyOffsetLocal( ...
+        rxTimed,sampleRate,-coarseCFOHz);
+
+    %% 4. Fine CFO
+    rxLLTF = rxTimed(fieldIndices.LLTF(1):fieldIndices.LLTF(2),:);
+    fineCFOHz = wlanFineCFOEstimate(rxLLTF,channelBandwidth);
+    rxSynchronized = applyFrequencyOffsetLocal( ...
+        rxTimed,sampleRate,-fineCFOHz);
+
+    rxLLTF = rxSynchronized(fieldIndices.LLTF(1):fieldIndices.LLTF(2),:);
+    lltfDemod = wlanEHTDemodulate(rxLLTF,'L-LTF',cfgEHT);
+    noiseVariance = single(wlanLLTFNoiseEstimate(lltfDemod));
+
+    %% 5-6. EHT-LTF demodulation and channel estimation
+    rxEHTLTF = rxSynchronized( ...
+        fieldIndices.EHTLTF(1):fieldIndices.EHTLTF(2),:);
+    ehtLTFDemod = wlanEHTDemodulate(rxEHTLTF,'EHT-LTF',cfgEHT);
+    channelEstimate = wlanEHTLTFChannelEstimate(ehtLTFDemod,cfgEHT);
+
+    %% 5 & 7. EHT-Data demodulation, pilot tracking, equalization
+    rxEHTData = rxSynchronized( ...
+        fieldIndices.EHTData(1):fieldIndices.EHTData(2),:);
+    dataDemod = wlanEHTDemodulate(rxEHTData,'EHT-Data',cfgEHT);
+    trackedData = wlanEHTTrackPilotError( ...
+        dataDemod,channelEstimate,cfgEHT,'EHT-Data');
+    [equalizedAll,csiAll] = wlanEHTEqualize( ...
+        trackedData,channelEstimate,noiseVariance,cfgEHT,'EHT-Data',1);
+
+    % Recreate exactly the CPU soft-information path through the point
+    % immediately before LDPC decoding so it can be compared with CUDA.
+    dataInfo = wlanEHTOFDMInfo('EHT-Data',cfgEHT);
+    equalizedData = equalizedAll(dataInfo.DataIndices,:,:);
+    csiData = csiAll(dataInfo.DataIndices,:);
+
+    prep = wlanEHTPrepareDemapperInput( ...
+        equalizedData,noiseVariance,csiData,cfgEHT,1, ...
+        LDPCDecodingMethod='norm-min-sum', ...
+        MinSumScalingFactor=0.75, ...
+        MaximumLDPCIterationCount=12, ...
+        EarlyTermination=false);
+
+    externalLLR = cell(1,prep.NumSegments);
+    for l = 1:prep.NumSegments
+        externalLLR{l} = wlanConstellationDemap( ...
+            prep.DataSymbols{l},noiseVariance, ...
+            prep.UserParameters.NBPSCS,'soft', ...
+            OutputDataType='single');
+    end
+
+    cpuEncodedLLR = buildCPUEncodedLLRDiagnosticLocal(prep,externalLLR);
+
+    cpuCSI = [];
+    for l = 1:prep.NumSegments
+        cpuCSI = [cpuCSI; reshape(prep.CSIToneMapperOutput{l},[],1)]; %#ok<AGROW>
+    end
+
+    diag = struct;
+    diag.CoarseOffset = double(coarsePacketOffset);
+    diag.FineTimingOffset = double(fineTimingOffset);
+    diag.FinalOffset = double(finalPacketOffset);
+    diag.CoarseCFOHz = double(coarseCFOHz);
+    diag.FineCFOHz = double(fineCFOHz);
+    diag.NoiseVariance = double(noiseVariance);
+    diag.ChannelEstimate = single(channelEstimate);
+    diag.EqualizedActive = single(equalizedAll);
+    diag.CSIWeights = single(cpuCSI);
+    diag.EncodedLLR = single(cpuEncodedLLR(:));
+end
+
+
+function encodedData = buildCPUEncodedLLRDiagnosticLocal(prep,externalLLR)
+%BUILDCPUENCODEDLLRDIAGNOSTICLOCAL
+% Reproduces the project's CPU Stage-9 processing through the exact
+% soft vector supplied to the LDPC decoder. This function is diagnostic
+% only and is never called from a timed benchmark region.
+
+    userParams = prep.UserParameters;
+    nsym = prep.NumOFDMSymbols;
+    nss = prep.NumSpatialStreams;
+    L = prep.NumSegments;
+    channelCoding = prep.ChannelCoding;
+    ruSize = prep.RUSize;
+    ruSize80MHzSubblock = prep.RUSize80MHzSubblock;
+    csiToneMapperOut = prep.CSIToneMapperOutput;
+
+    interleavedBits = cell(1,L);
+    parsedData = cell(1,L);
+
+    for l = 1:L
+        interleavedSym = externalLLR{l};
+        interleavedBitsScaled = reshape( ...
+            interleavedSym,userParams.NBPSCS,[],nsym,nss) .* ...
+            reshape(csiToneMapperOut{l},1,[],1,nss);
+
+        interleavedBits{l} = reshape( ...
+            interleavedBitsScaled,[],nsym,nss);
+
+        parsedData{l} = cast(0,prep.InputClass);
+    end
+
+    if channelCoding == wlan.type.ChannelCoding.bcc
+        interleavedBitsBCC = reshape(interleavedBits{1},[],nss,L);
+        assert(L == 1);
+        NCBPSSI = userParams.NCBPS/userParams.NSS;
+        parsedData{1} = wlan.internal.heBCCDeinterleave( ...
+            interleavedBitsBCC,ruSize80MHzSubblock, ...
+            userParams.NBPSCS,NCBPSSI,userParams.DCM, ...
+            userParams.NCBPSLAST);
+    else
+        parsedData = interleavedBits;
+    end
+
+    if sum(ruSize) >= 1480
+        streamParsedData = wlan.internal.ehtSegmentDeparseBits( ...
+            parsedData,nsym,nss,userParams.NBPSCS,ruSize,userParams.DCM);
+    else
+        streamParsedData = reshape(parsedData{1}(:), ...
+            userParams.NSD*nsym*userParams.NBPSCS,nss);
+    end
+
+    Nes = 1;
+    postFECpaddedData = wlanStreamDeparse( ...
+        streamParsedData,Nes,userParams.NCBPS,userParams.NBPSCS);
+
+    encodedData = wlan.internal.heRemovePostFECPadding( ...
+        postFECpaddedData,channelCoding,userParams);
+
+    encodedData = single(encodedData(:));
+end
+
 
 function checksum = checksumLocal(bits,payloadBitsPerPacket)
 bits = double(bits(1:payloadBitsPerPacket));

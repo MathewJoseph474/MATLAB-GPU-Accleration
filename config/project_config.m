@@ -24,7 +24,7 @@ cfg.Execution.RunCPU = true;
 cfg.Execution.RunGPU = true;
 
 % before the timed benchmark begins.
-cfg.Execution.ValidationPackets = 4; % Number of packets used for correctness validation
+cfg.Execution.ValidationPackets = 128; % Number of packets used for correctness validation
 
 % Warm-up is excluded from the timed region.
 cfg.Execution.WarmupPackets = 2; % Number of packets used to warm up the receiver.
@@ -44,7 +44,6 @@ cfg.Packets.Values = [
    8192
    16384
    32768
-   65536
 ];
 
 % Power-of-two mode

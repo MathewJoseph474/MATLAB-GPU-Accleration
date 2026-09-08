@@ -7,6 +7,7 @@ function databasePath = build_eht_receiver_database_128()
 %   Random PSDU bits
 %   EHT waveform generation
 %   Scrambling, LDPC, 4096-QAM, OFDM and preamble generation
+%   TGax Channel Model D (indoor office multipath fading)
 %   Timing offset
 %   Carrier-frequency offset
 %   AWGN
@@ -55,6 +56,14 @@ databasePath = fullfile(databaseDir,'eht_receiver_database_128.mat');
     opts.APEPLengthBytes = cfg.PacketSize.BitsPerPacket / 8;
     opts.ChannelCoding = 'LDPC';
     opts.NumSpaceTimeStreams = 1;
+
+    % Controlled indoor multipath channel. Large-scale path loss/shadowing
+    % and fluorescent-light Doppler are disabled for the first validation
+    % step so Channel D is the only new propagation impairment.
+    opts.ChannelDelayProfile = 'Model-D';
+    opts.ChannelRandomSeed = 20260902;
+    opts.ChannelLargeScaleFadingEffect = 'None';
+    opts.ChannelFluorescentEffect = false;
 
     opts.SNRdB = 42;
     opts.InsertedTimingOffsetSamples = 256;
@@ -107,6 +116,9 @@ databasePath = fullfile(databaseDir,'eht_receiver_database_128.mat');
     fprintf('MCS                 : %d (4096-QAM)\n',opts.MCS);
     fprintf('APEP length         : %d bytes\n',opts.APEPLengthBytes);
     fprintf('Channel coding      : %s\n',opts.ChannelCoding);
+    fprintf('Channel model       : TGax %s (indoor office)\n',opts.ChannelDelayProfile);
+    fprintf('Large-scale fading  : %s\n',opts.ChannelLargeScaleFadingEffect);
+    fprintf('Fluorescent effect  : %s\n',onOffLocal(opts.ChannelFluorescentEffect));
     fprintf('Parallel generation : %s\n',onOffLocal(useParallel));
 
     if useParallel
@@ -139,6 +151,11 @@ databasePath = fullfile(databaseDir,'eht_receiver_database_128.mat');
     metadata.PSDULengthBytes = psduBytes(1);
     metadata.ChannelCoding = opts.ChannelCoding;
     metadata.NumSpaceTimeStreams = opts.NumSpaceTimeStreams;
+    metadata.ChannelModel = 'wlanTGaxChannel';
+    metadata.ChannelDelayProfile = opts.ChannelDelayProfile;
+    metadata.ChannelLargeScaleFadingEffect = opts.ChannelLargeScaleFadingEffect;
+    metadata.ChannelFluorescentEffect = opts.ChannelFluorescentEffect;
+    metadata.ChannelRandomSeed = opts.ChannelRandomSeed;
     metadata.SNRdB = opts.SNRdB;
     metadata.InsertedTimingOffsetSamples = ...
         opts.InsertedTimingOffsetSamples;
@@ -283,12 +300,43 @@ function packet = generateOnePacketLocal( ...
     txBits = randi([0 1],bitsPerPacket,1,'int8');
     txWaveform = single(wlanWaveformGenerator(txBits,cfgEHT));
 
+    %% TGax Channel Model D - indoor office multipath
+    % Use a deterministic but packet-specific channel realization so that
+    % every database rebuild is reproducible and the 128 packets do not all
+    % experience the same fading realization.
+    channelSeed = opts.ChannelRandomSeed + packetIndex - 1;
+
+    tgaxChannel = wlanTGaxChannel( ...
+        'SampleRate',sampleRate, ...
+        'ChannelBandwidth',opts.ChannelBandwidth, ...
+        'DelayProfile',opts.ChannelDelayProfile, ...
+        'NumTransmitAntennas',1, ...
+        'NumReceiveAntennas',1, ...
+        'LargeScaleFadingEffect',opts.ChannelLargeScaleFadingEffect, ...
+        'FluorescentEffect',opts.ChannelFluorescentEffect, ...
+        'RandomStream','mt19937ar with seed', ...
+        'Seed',channelSeed);
+
+    % Preserve delayed channel energy at the end of the packet. The TGax
+    % System object returns the same number of samples it receives, so add
+    % enough zero tail to accommodate its filter delay and largest path.
+    channelInfo = info(tgaxChannel);
+    channelTailSamples = channelInfo.ChannelFilterDelay + ...
+        ceil(max(channelInfo.PathDelays)*sampleRate);
+
+    channelInput = [
+        txWaveform;
+        complex(zeros(channelTailSamples,size(txWaveform,2),'single'))
+    ];
+
+    channelWaveform = single(tgaxChannel(channelInput));
+
     %% Timing offset
     timingOffset = opts.InsertedTimingOffsetSamples;
 
     delayedWaveform = [
-        complex(zeros(timingOffset,size(txWaveform,2),'single'));
-        txWaveform
+        complex(zeros(timingOffset,size(channelWaveform,2),'single'));
+        channelWaveform
     ];
 
     %% Carrier-frequency offset
