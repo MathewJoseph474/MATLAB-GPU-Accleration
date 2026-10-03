@@ -2041,16 +2041,6 @@ __global__ void validateBatchBackendKernel(const int8_t* dec,const int8_t* seq,c
  int i=int(blockIdx.x)*blockDim.x+threadIdx.x,b=int(blockIdx.y);if(b>=batch||i>=kPayloadBits)return;int si=16+i;int8_t v=dec[size_t(b)*kTotalDecodedBits+si];if(en[b])v=int8_t(v^seq[size_t(b)*2047+(si%2047)]);if(v)atomicAdd(cs+b,(unsigned long long)(i+1));if(v!=ref[size_t(b)*kPayloadBits+i])atomicAdd(be+b,1U);
 }
 
-__global__ void checksumBatchBackendKernel(const int8_t* dec,const int8_t* seq,const int* en,unsigned long long* cs,int batch)
-{
- int i=int(blockIdx.x)*blockDim.x+threadIdx.x,b=int(blockIdx.y);
- if(b>=batch||i>=kPayloadBits)return;
- int si=16+i;
- int8_t v=dec[size_t(b)*kTotalDecodedBits+si];
- if(en[b])v=int8_t(v^seq[size_t(b)*2047+(si%2047)]);
- if(v)atomicAdd(cs+b,(unsigned long long)(i+1));
-}
-
 double scalar(const mxArray* value,const char* name) {
     if (!mxIsNumeric(value) || mxIsComplex(value) ||
         mxGetNumberOfElements(value) != 1) {
@@ -2111,16 +2101,6 @@ std::string commandString(const mxArray* value) {
     mxFree(raw);
     return command;
 }
-
-void validateCellCount(const mxArray* value,const char* name) {
-    if (!mxIsCell(value) ||
-        mxGetNumberOfElements(value) != kNumSegments) {
-        mexErrMsgIdAndTxt(
-            "eht_receiver_cuda_async:Input",
-            "%s must be a four-element cell array.",name);
-    }
-}
-
 
 void copyComplexSingleWindow(
     const mxArray* input,
@@ -4874,152 +4854,6 @@ void e2eBatchRunCommand(int nlhs,mxArray* plhs[],int nrhs,const mxArray* prhs[])
     CUDA_CHECK(cudaEventDestroy(evOFDMStart));
     CUDA_CHECK(cudaEventDestroy(evFineCFOEnd));CUDA_CHECK(cudaEventDestroy(evTimingSyncEnd));CUDA_CHECK(cudaEventDestroy(evCoarseCFOEnd));CUDA_CHECK(cudaEventDestroy(evPacketDetectEnd));CUDA_CHECK(cudaEventDestroy(evPacketDetectStart));
     if(lp)cufftDestroy(lp);if(dp)cufftDestroy(dp);cudaFree(cs);cudaFree(den);cudaFree(descr);cudaFree(seq);cudaFree(dec);cudaFree(msg);cudaFree(bel);cudaFree(enc);cudaFree(ellr);cudaFree(invq);cudaFree(csi);cudaFree(qq);cudaFree(qi);cudaFree(eq);cudaFree(rot);cudaFree(ch);cudaFree(da);cudaFree(la);cudaFree(doo);cudaFree(di);cudaFree(lo);cudaFree(li);cudaFree(df);cudaFree(lf);cudaFree(nv);cudaFree(fc);cudaFree(fin);cudaFree(corr);cudaFree(met);cudaFree(cc);cudaFree(off);cudaFree(is);cudaFree(tr);cudaFree(w);cudaFree(rq);cudaFree(ri);if(nlhs==1)plhs[0]=out;else mxDestroyArray(out);
-}
-
-void e2eBatchLegacyCommand(
-    int nlhs,mxArray* plhs[],int nrhs,const mxArray* prhs[])
-{
-    // Legacy correctness implementation retained for reference.
-    // command + 14 inputs, matching e2e, except RxI/RxQ are
-    // [samplesPerPacket x batchSize] and RxScale may be scalar or batchSize.
-    if (nrhs != 15)
-        mexErrMsgIdAndTxt(
-            "eht_receiver_cuda_e2e:InputCount",
-            "e2eBatch expects command plus 14 inputs.");
-    if (nlhs > 1)
-        mexErrMsgIdAndTxt(
-            "eht_receiver_cuda_e2e:OutputCount",
-            "e2eBatch returns one batch validation structure.");
-
-    if (!mxIsInt16(prhs[1]) || mxIsComplex(prhs[1]) ||
-        !mxIsInt16(prhs[2]) || mxIsComplex(prhs[2]))
-        mexErrMsgIdAndTxt(
-            "eht_receiver_cuda_e2e:Input",
-            "RxI and RxQ must be real int16 matrices.");
-
-    const mwSize samplesPerPacket = mxGetM(prhs[1]);
-    const mwSize batchSize = mxGetN(prhs[1]);
-    if (samplesPerPacket < kPacketLengthSamples || batchSize < 1 ||
-        mxGetM(prhs[2]) != samplesPerPacket ||
-        mxGetN(prhs[2]) != batchSize)
-        mexErrMsgIdAndTxt(
-            "eht_receiver_cuda_e2e:Input",
-            "RxI and RxQ must be [samplesPerPacket x batchSize] with at least %d samples per packet.", kPacketLengthSamples);
-
-    const mwSize scaleCount = mxGetNumberOfElements(prhs[3]);
-    if (scaleCount != 1 && scaleCount != batchSize)
-        mexErrMsgIdAndTxt(
-            "eht_receiver_cuda_e2e:Input",
-            "RxScale must be scalar or contain one value per packet in the batch.");
-
-    // Reference bits may be one common [kPayloadBits x 1] vector or
-    // [kPayloadBits x batchSize] for packet-specific validation.
-    if (mxIsComplex(prhs[14]) ||
-        !(mxIsInt8(prhs[14]) || mxIsLogical(prhs[14])))
-        mexErrMsgIdAndTxt(
-            "eht_receiver_cuda_e2e:Input",
-            "referencePayloadBits must be int8/logical.");
-    const mwSize refRows = mxGetM(prhs[14]);
-    const mwSize refCols = mxGetN(prhs[14]);
-    if (refRows != kPayloadBits || (refCols != 1 && refCols != batchSize))
-        mexErrMsgIdAndTxt(
-            "eht_receiver_cuda_e2e:Input",
-            "referencePayloadBits must be [%d x 1] or [%d x batchSize].",kPayloadBits,kPayloadBits);
-
-    const char* fields[] = {
-        "BatchSize","PacketsProcessed","TotalBitErrors","FailedPackets",
-        "Checksums","BitErrorsPerPacket","PacketErrorsPerPacket",
-        "ReturnedBulkOutputBytes","Pass"
-    };
-    mxArray* out = mxCreateStructMatrix(1,1,9,fields);
-    mxArray* checksums = mxCreateDoubleMatrix(batchSize,1,mxREAL);
-    mxArray* bitErrors = mxCreateDoubleMatrix(batchSize,1,mxREAL);
-    mxArray* packetErrors = mxCreateDoubleMatrix(batchSize,1,mxREAL);
-    double* checksumData = mxGetPr(checksums);
-    double* bitErrorData = mxGetPr(bitErrors);
-    double* packetErrorData = mxGetPr(packetErrors);
-
-    const int16_t* allI = static_cast<const int16_t*>(mxGetData(prhs[1]));
-    const int16_t* allQ = static_cast<const int16_t*>(mxGetData(prhs[2]));
-
-    double totalBitErrors = 0.0;
-    double failedPackets = 0.0;
-    double returnedBytes = 0.0;
-
-    for (mwSize b = 0; b < batchSize; ++b) {
-        mxArray* rxI = mxCreateNumericMatrix(samplesPerPacket,1,mxINT16_CLASS,mxREAL);
-        mxArray* rxQ = mxCreateNumericMatrix(samplesPerPacket,1,mxINT16_CLASS,mxREAL);
-        std::memcpy(mxGetData(rxI),allI + b*samplesPerPacket,
-                    size_t(samplesPerPacket)*sizeof(int16_t));
-        std::memcpy(mxGetData(rxQ),allQ + b*samplesPerPacket,
-                    size_t(samplesPerPacket)*sizeof(int16_t));
-
-        double scaleValue = 0.0;
-        if (mxIsDouble(prhs[3])) {
-            const double* p = mxGetDoubles(prhs[3]);
-            scaleValue = p[scaleCount == 1 ? 0 : b];
-        } else if (mxIsSingle(prhs[3])) {
-            const float* p = mxGetSingles(prhs[3]);
-            scaleValue = double(p[scaleCount == 1 ? 0 : b]);
-        } else {
-            scaleValue = scalar(prhs[3],"RxScale");
-        }
-        mxArray* scale = mxCreateDoubleScalar(scaleValue);
-
-        mxArray* refBits = nullptr;
-        if (mxIsInt8(prhs[14])) {
-            refBits = mxCreateNumericMatrix(kPayloadBits,1,mxINT8_CLASS,mxREAL);
-            const int8_t* src = static_cast<const int8_t*>(mxGetData(prhs[14]));
-            const mwSize col = refCols == 1 ? 0 : b;
-            std::memcpy(mxGetData(refBits),src + col*kPayloadBits,
-                        size_t(kPayloadBits)*sizeof(int8_t));
-        } else {
-            refBits = mxCreateLogicalMatrix(kPayloadBits,1);
-            const mxLogical* src = mxGetLogicals(prhs[14]);
-            const mwSize col = refCols == 1 ? 0 : b;
-            std::memcpy(mxGetLogicals(refBits),src + col*kPayloadBits,
-                        size_t(kPayloadBits)*sizeof(mxLogical));
-        }
-
-        const mxArray* onePrhs[15] = {
-            prhs[0], rxI, rxQ, scale, prhs[4], prhs[5], prhs[6], prhs[7],
-            prhs[8], prhs[9], prhs[10], prhs[11], prhs[12], prhs[13], refBits
-        };
-        mxArray* oneOut[1] = {nullptr};
-        e2eCommand(1,oneOut,15,onePrhs);
-
-        mxArray* f = mxGetField(oneOut[0],0,"BitErrors");
-        bitErrorData[b] = mxGetScalar(f);
-        f = mxGetField(oneOut[0],0,"PacketErrors");
-        packetErrorData[b] = mxGetScalar(f);
-        f = mxGetField(oneOut[0],0,"PayloadChecksum");
-        checksumData[b] = mxGetScalar(f);
-        f = mxGetField(oneOut[0],0,"ReturnedBulkOutputBytes");
-        returnedBytes += mxGetScalar(f);
-
-        totalBitErrors += bitErrorData[b];
-        failedPackets += packetErrorData[b];
-
-        mxDestroyArray(oneOut[0]);
-        mxDestroyArray(refBits);
-        mxDestroyArray(scale);
-        mxDestroyArray(rxQ);
-        mxDestroyArray(rxI);
-    }
-
-    mxSetField(out,0,"BatchSize",mxCreateDoubleScalar(double(batchSize)));
-    mxSetField(out,0,"PacketsProcessed",mxCreateDoubleScalar(double(batchSize)));
-    mxSetField(out,0,"TotalBitErrors",mxCreateDoubleScalar(totalBitErrors));
-    mxSetField(out,0,"FailedPackets",mxCreateDoubleScalar(failedPackets));
-    mxSetField(out,0,"Checksums",checksums);
-    mxSetField(out,0,"BitErrorsPerPacket",bitErrors);
-    mxSetField(out,0,"PacketErrorsPerPacket",packetErrors);
-    mxSetField(out,0,"ReturnedBulkOutputBytes",mxCreateDoubleScalar(returnedBytes));
-    mxSetField(out,0,"Pass",mxCreateLogicalScalar(
-        totalBitErrors == 0.0 && failedPackets == 0.0 && returnedBytes == 0.0));
-
-    if (nlhs == 1) plhs[0] = out;
-    else mxDestroyArray(out);
 }
 
 void submitCommand(
