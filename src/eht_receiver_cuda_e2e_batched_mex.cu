@@ -1,16 +1,18 @@
 // eht_receiver_cuda_e2e_batched_mex.cu
 //
-// MATLAB command API:
-//   ticket = eht_receiver_cuda_async_mex('submit', ...
-//       iSegments,qSegments,quantScales,csiSegments, ...
-//       noiseVariance,llrScale,validationMode[,referencePayloadBits])
+// Production MATLAB command API:
+//   info = eht_receiver_cuda_e2e_batched_mex(
+//       'e2eBatchPrepare',sampleCount,batchCapacity)
+//   ticket = eht_receiver_cuda_e2e_batched_mex(
+//       'e2eBatchSubmit',RxI,RxQ,RxScale,...)
+//   ready = eht_receiver_cuda_e2e_batched_mex('e2eBatchPoll',ticket)
+//   stats = eht_receiver_cuda_e2e_batched_mex('e2eBatchCollect',ticket)
+//   eht_receiver_cuda_e2e_batched_mex('e2eBatchReset')
 //
-//   stats = eht_receiver_cuda_async_mex('collect',ticket)
-//   ready = eht_receiver_cuda_async_mex('poll',ticket)
-//   info  = eht_receiver_cuda_async_mex('status')
-//   eht_receiver_cuda_async_mex('reset')
+// e2eBatchRun uses the same prepare/submit/collect implementation but waits
+// before returning. e2eBatch adds reference-bit validation and diagnostic
+// bulk outputs. The commands below are retained as stage-level diagnostics.
 //
-// To-do 
 // Part 2 development command:
 //   rx = eht_receiver_cuda_e2e_batched_mex('reconstruct',RxI,RxQ,RxScale)
 //
@@ -36,12 +38,12 @@
 //     Runs the raw INT16 waveform through synchronization and the existing
 //     CUDA FFT/channel/equalizer/QAM/LDPC/validation backend in one MEX call.
 //
-// 'submit' stages MATLAB inputs into persistent pinned host memory, enqueues
-// H2D copies and all CUDA kernels on one of two nonblocking streams, and
-// returns without synchronizing the stream.
+// 'e2eBatchSubmit' stages MATLAB inputs into persistent pinned host memory,
+// enqueues H2D copies and all CUDA kernels on one of four nonblocking streams,
+// and returns without synchronizing the stream.
 //
-// 'collect' waits only for the requested ticket, copies no bulk arrays, and
-// returns scalar counters/timings.
+// 'e2eBatchCollect' waits only for the requested ticket, copies no bulk arrays,
+// and returns scalar counters/timings.
 //
 // Fixed configuration:
 //   EHT 320 MHz, MCS 13, 4096-QAM, LDPC rate 5/6,
@@ -138,11 +140,9 @@ struct Slot {
     cufftComplex* dPilotRotation = nullptr;
     cufftComplex* dEqualizedActive = nullptr;
 
-    int16_t* dI = nullptr;
-    int16_t* dQ = nullptr;
+    float* dNoiseVariance = nullptr;
     float* dCSI = nullptr;
-    float* dInverseQuantScales = nullptr;
-    int8_t* dExternalLLR = nullptr;
+    float* dExternalLLR = nullptr;
     float* dEncoded = nullptr;
     float* dBeliefs = nullptr;
     float* dMessages = nullptr;
@@ -250,12 +250,7 @@ struct BatchedSlot {
     
     // QAM / LLR
 
-    int16_t* dQuantizedI = nullptr;
-    int16_t* dQuantizedQ = nullptr;
-
     float* dCSI = nullptr;
-    float* dInverseQuantScale = nullptr;
-
     float* dExternalLLR = nullptr;
     float* dEncoded = nullptr;
 
@@ -346,10 +341,8 @@ void freeSlotResources(Slot& s) {
     if (s.dPilotRotation) cudaFree(s.dPilotRotation);
     if (s.dEqualizedActive) cudaFree(s.dEqualizedActive);
 
-    if (s.dI) cudaFree(s.dI);
-    if (s.dQ) cudaFree(s.dQ);
+    if (s.dNoiseVariance) cudaFree(s.dNoiseVariance);
     if (s.dCSI) cudaFree(s.dCSI);
-    if (s.dInverseQuantScales) cudaFree(s.dInverseQuantScales);
     if (s.dExternalLLR) cudaFree(s.dExternalLLR);
     if (s.dEncoded) cudaFree(s.dEncoded);
     if (s.dBeliefs) cudaFree(s.dBeliefs);
@@ -420,10 +413,7 @@ void freeBatchedSlotResources(BatchedSlot& s)
     if (s.dEqualized) cudaFree(s.dEqualized);
 
     // QAM / LLR.
-    if (s.dQuantizedI) cudaFree(s.dQuantizedI);
-    if (s.dQuantizedQ) cudaFree(s.dQuantizedQ);
     if (s.dCSI) cudaFree(s.dCSI);
-    if (s.dInverseQuantScale) cudaFree(s.dInverseQuantScale);
     if (s.dExternalLLR) cudaFree(s.dExternalLLR);
     if (s.dEncoded) cudaFree(s.dEncoded);
 
@@ -543,11 +533,8 @@ void allocateBatchedSlot(
     CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&s.dPilotRotation),B*size_t(kNumDataSymbols)*sizeof(cufftComplex)));
     CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&s.dEqualized),B*size_t(kActiveToneCount)*size_t(kNumDataSymbols)*sizeof(cufftComplex)));
 
-    // Quantization / QAM / LLR.
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&s.dQuantizedI),B*size_t(kTotalSymbols)*sizeof(int16_t)));
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&s.dQuantizedQ),B*size_t(kTotalSymbols)*sizeof(int16_t)));
+    // QAM / LLR.
     CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&s.dCSI),B*size_t(kDataToneCount)*sizeof(float)));
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&s.dInverseQuantScale),B*size_t(kNumSegments)*sizeof(float)));
     CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&s.dExternalLLR),B*size_t(kTotalSymbols)*size_t(kBitsPerSymbol)*sizeof(float)));
     CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&s.dEncoded),B*size_t(kEncodedLength)*sizeof(float)));
 
@@ -749,20 +736,14 @@ void allocateSlot(Slot& s) {
         size_t(kActiveToneCount*kNumDataSymbols)*sizeof(cufftComplex)));
 
     CUDA_CHECK(cudaMalloc(
-        reinterpret_cast<void**>(&s.dI),
-        size_t(kTotalSymbols)*sizeof(int16_t)));
-    CUDA_CHECK(cudaMalloc(
-        reinterpret_cast<void**>(&s.dQ),
-        size_t(kTotalSymbols)*sizeof(int16_t)));
+        reinterpret_cast<void**>(&s.dNoiseVariance),
+        sizeof(float)));
     CUDA_CHECK(cudaMalloc(
         reinterpret_cast<void**>(&s.dCSI),
         size_t(kNumSegments*kTonesPerSegment)*sizeof(float)));
     CUDA_CHECK(cudaMalloc(
-        reinterpret_cast<void**>(&s.dInverseQuantScales),
-        size_t(kNumSegments)*sizeof(float)));
-    CUDA_CHECK(cudaMalloc(
         reinterpret_cast<void**>(&s.dExternalLLR),
-        size_t(kTotalExternalElements)*sizeof(int8_t)));
+        size_t(kTotalExternalElements)*sizeof(float)));
     CUDA_CHECK(cudaMalloc(
         reinterpret_cast<void**>(&s.dEncoded),
         size_t(kEncodedLength)*sizeof(float)));
@@ -1367,197 +1348,11 @@ __global__ void extractFieldsBatchKernel(const cufftComplex* rx,const int* final
     constexpr int lstart=kEHTLTFStart,llen=kEHTLTFLength,dstart=kEHTDataStart,dlen=kEHTDataLength;int i=int(blockIdx.x)*blockDim.x+threadIdx.x,b=int(blockIdx.y);if(b>=batchSize)return;int st=finalOff[b];if(st<0)return;const auto*x=rx+size_t(b)*count;if(i<llen&&st+lstart+i<count)ltf[size_t(b)*llen+i]=x[st+lstart+i];if(i<dlen&&st+dstart+i<count)data[size_t(b)*dlen+i]=x[st+dstart+i];
 }
 
-__global__ void extractActiveKernel(
-    const cufftComplex* __restrict__ ltfFFT,
-    const cufftComplex* __restrict__ dataFFT,
-    const int* __restrict__ ltfIndices,
-    const int* __restrict__ dataIndices,
-    cufftComplex* __restrict__ ltfActive,
-    cufftComplex* __restrict__ dataActive)
-{
-    int i = int(blockIdx.x)*blockDim.x + threadIdx.x;
-    if (i >= kActiveToneCount) return;
 
-    const int ltfBin = ltfIndices[i];
-    const int dataBin = dataIndices[i];
 
-    ltfActive[i] = ltfFFT[ltfBin];
-    for (int sym = 0; sym < kNumDataSymbols; ++sym) {
-        dataActive[size_t(sym)*kActiveToneCount+i] =
-            dataFFT[size_t(sym)*kFFTLength+dataBin];
-    }
-}
 
-__global__ void estimateChannelKernel(
-    const cufftComplex* __restrict__ ltfActive,
-    const cufftComplex* __restrict__ knownLTF,
-    cufftComplex* __restrict__ channel)
-{
-    int i = int(blockIdx.x)*blockDim.x + threadIdx.x;
-    if (i >= kActiveToneCount) return;
-    const cufftComplex y = ltfActive[i];
-    const cufftComplex r = knownLTF[i];
-    channel[i].x = y.x*r.x + y.y*r.y;
-    channel[i].y = y.y*r.x - y.x*r.y;
-}
 
-__global__ void estimatePilotRotationKernel(
-    const cufftComplex* __restrict__ dataActive,
-    const cufftComplex* __restrict__ channel,
-    const int* __restrict__ pilotIndices,
-    const cufftComplex* __restrict__ pilotReference,
-    int pilotCount,
-    cufftComplex* __restrict__ rotation)
-{
-    int symbol = blockIdx.x;
-    extern __shared__ cufftComplex partial[];
-    cufftComplex sum{0.0f,0.0f};
 
-    for (int p = threadIdx.x; p < pilotCount; p += blockDim.x) {
-        int tone = pilotIndices[p];
-        cufftComplex y = dataActive[symbol*kActiveToneCount+tone];
-        cufftComplex h = channel[tone];
-        cufftComplex r = pilotReference[symbol*pilotCount+p];
-
-        cufftComplex expected;
-        expected.x = h.x*r.x-h.y*r.y;
-        expected.y = h.x*r.y+h.y*r.x;
-
-        sum.x += y.x*expected.x+y.y*expected.y;
-        sum.y += y.y*expected.x-y.x*expected.y;
-    }
-
-    partial[threadIdx.x] = sum;
-    __syncthreads();
-
-    for (int stride = blockDim.x/2; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) {
-            partial[threadIdx.x].x += partial[threadIdx.x+stride].x;
-            partial[threadIdx.x].y += partial[threadIdx.x+stride].y;
-        }
-        __syncthreads();
-    }
-
-    if (threadIdx.x == 0) {
-        float mag = sqrtf(
-            partial[0].x*partial[0].x+
-            partial[0].y*partial[0].y);
-        rotation[symbol] = mag > 0.0f
-            ? cufftComplex{partial[0].x/mag,-partial[0].y/mag}
-            : cufftComplex{1.0f,0.0f};
-    }
-}
-
-__global__ void equalizeKernel(
-    const cufftComplex* __restrict__ dataActive,
-    const cufftComplex* __restrict__ channel,
-    const cufftComplex* __restrict__ rotation,
-    float noiseVariance,
-    cufftComplex* __restrict__ equalized)
-{
-    int i = int(blockIdx.x)*blockDim.x + threadIdx.x;
-    if (i >= kActiveToneCount*kNumDataSymbols) return;
-
-    int tone = i % kActiveToneCount;
-    int symbol = i / kActiveToneCount;
-
-    cufftComplex in = dataActive[i];
-    cufftComplex rot = rotation[symbol];
-    cufftComplex y{
-        in.x*rot.x-in.y*rot.y,
-        in.x*rot.y+in.y*rot.x};
-
-    cufftComplex h = channel[tone];
-    float denom = h.x*h.x+h.y*h.y+noiseVariance;
-
-    equalized[i].x = (y.x*h.x+y.y*h.y)/denom;
-    equalized[i].y = (y.y*h.x-y.x*h.y)/denom;
-}
-
-__device__ __forceinline__ int16_t matlabRoundInt16(float value)
-{
-    float rounded = value >= 0.0f
-        ? floorf(value+0.5f)
-        : ceilf(value-0.5f);
-    rounded = fminf(32767.0f,fmaxf(-32768.0f,rounded));
-    return static_cast<int16_t>(rounded);
-}
-
-__global__ void segmentQuantizeCSIKernel(
-    const cufftComplex* __restrict__ equalized,
-    const cufftComplex* __restrict__ channel,
-    const int* __restrict__ dataIndices,
-    float noiseVariance,
-    int16_t* __restrict__ iOut,
-    int16_t* __restrict__ qOut,
-    float* __restrict__ csiOut,
-    float* __restrict__ inverseQuantScales)
-{
-    int segment = blockIdx.x;
-    __shared__ float peakValues[256];
-
-    float localPeak = 0.0f;
-    for (int linear = threadIdx.x;
-         linear < kSymbolsPerSegment;
-         linear += blockDim.x) {
-        int localTone = linear % kTonesPerSegment;
-        int symbol = linear / kTonesPerSegment;
-        int rawTone = segment*kTonesPerSegment+localTone;
-        int activeTone = dataIndices[rawTone];
-        cufftComplex x =
-            equalized[symbol*kActiveToneCount+activeTone];
-        localPeak = fmaxf(localPeak,fabsf(x.x));
-        localPeak = fmaxf(localPeak,fabsf(x.y));
-    }
-
-    peakValues[threadIdx.x] = localPeak;
-    __syncthreads();
-    for (int stride = blockDim.x/2; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride)
-            peakValues[threadIdx.x] =
-                fmaxf(peakValues[threadIdx.x],
-                      peakValues[threadIdx.x+stride]);
-        __syncthreads();
-    }
-
-    constexpr float numerator = 29490.30078125f;
-    float scale = peakValues[0] == 0.0f
-        ? 1.0f : numerator/peakValues[0];
-
-    if (threadIdx.x == 0)
-        inverseQuantScales[segment] = 1.0f/scale;
-    __syncthreads();
-
-    for (int outputLinear = threadIdx.x;
-         outputLinear < kSymbolsPerSegment;
-         outputLinear += blockDim.x) {
-        int permutedTone = outputLinear % kTonesPerSegment;
-        int symbol = outputLinear / kTonesPerSegment;
-
-        int row49 = permutedTone % 49;
-        int col20 = permutedTone / 49;
-        int rawLocalTone = col20+20*row49;
-
-        int rawTone = segment*kTonesPerSegment+rawLocalTone;
-        int activeTone = dataIndices[rawTone];
-        cufftComplex x =
-            equalized[symbol*kActiveToneCount+activeTone];
-
-        int outputIndex = segment*kSymbolsPerSegment+outputLinear;
-        iOut[outputIndex] = matlabRoundInt16(x.x*scale);
-        qOut[outputIndex] = matlabRoundInt16(x.y*scale);
-
-        if (symbol == 0) {
-            cufftComplex h = channel[activeTone];
-            float power = h.x*h.x+h.y*h.y;
-            // Channel-D fix: preserve channel-power variation for CSI
-            // weighting.  Do not normalize to pw/(pw+noiseVariance),
-            // which collapses the frequency-selective reliability profile
-            // toward one and destroys LDPC soft-information magnitude.
-            csiOut[segment*kTonesPerSegment+permutedTone] = power;
-        }
-    }
-}
 
 __device__ __forceinline__ unsigned int grayCode(
     unsigned int value)
@@ -1565,91 +1360,7 @@ __device__ __forceinline__ unsigned int grayCode(
     return value ^ (value >> 1U);
 }
 
-__global__ void qam4096DemapKernel(
-    const int16_t* __restrict__ iIn,
-    const int16_t* __restrict__ qIn,
-    int8_t* __restrict__ llrOut,
-    int symbolCount,
-    const float* __restrict__ inverseQuantScales,
-    float inverseNoiseVariance,
-    float llrScale)
-{
-    int symbol = int(blockIdx.x)*blockDim.x + threadIdx.x;
-    if (symbol >= symbolCount) return;
 
-    constexpr float constellationNorm =
-        1.0f / 52.24940180716435f;
-
-    int segment = symbol / kSymbolsPerSegment;
-    float inverseQuantScale = inverseQuantScales[segment];
-
-    float samples[2] = {
-        float(iIn[symbol]) * inverseQuantScale,
-        float(qIn[symbol]) * inverseQuantScale
-    };
-
-    #pragma unroll
-    for (int axis = 0; axis < 2; ++axis) {
-        float sample = samples[axis];
-
-        #pragma unroll
-        for (int bit = 0; bit < 6; ++bit) {
-            float min0 = FLT_MAX;
-            float min1 = FLT_MAX;
-            int bitPosition = 5-bit;
-
-            #pragma unroll 8
-            for (int levelIndex = 0; levelIndex < 64; ++levelIndex) {
-                int integerLevel = -63 + 2*levelIndex;
-                float level = float(integerLevel)*constellationNorm;
-                float delta = sample-level;
-                float distance = delta*delta;
-                unsigned int label = grayCode(
-                    static_cast<unsigned int>(levelIndex));
-                unsigned int value =
-                    (label >> bitPosition) & 1U;
-
-                if (value == 0U) min0 = fminf(min0,distance);
-                else min1 = fminf(min1,distance);
-            }
-
-            float llr = (min1-min0)*inverseNoiseVariance;
-            float scaled = nearbyintf(llr*llrScale);
-            float clipped = fminf(127.0f,fmaxf(-128.0f,scaled));
-
-            llrOut[symbol*kBitsPerSymbol + axis*6 + bit] =
-                static_cast<int8_t>(clipped);
-        }
-    }
-}
-
-__global__ void mapWeightKernel(
-    const int8_t* __restrict__ externalLLR,
-    const float* __restrict__ csi,
-    const uint32_t* __restrict__ encodedSourceIndex,
-    float inverseLLRScale,
-    float* __restrict__ encoded)
-{
-    int index = int(blockIdx.x)*blockDim.x + threadIdx.x;
-    if (index >= kEncodedLength) return;
-
-    uint32_t source = encodedSourceIndex[index];
-    int segment = int(source / kExternalElementsPerSegment);
-    int local = int(source % kExternalElementsPerSegment);
-
-    int row = local % (kBitsPerSymbol*kTonesPerSegment);
-    int bit = row % kBitsPerSymbol;
-    int tone = row / kBitsPerSymbol;
-
-    float value = float(externalLLR[source])*inverseLLRScale;
-
-    // The fused max-log demapper already produces MATLAB-compatible
-    // polarity for bit position 7. The standalone qam4096 MEX requires a
-    // host-side bit-7 sign correction, but applying that correction again
-    // here would invert one LLR per QAM symbol.
-    value *= csi[segment*kTonesPerSegment + tone];
-    encoded[index] = value;
-}
 
 // Exact IEEE 802.11 N=1944, rate-5/6 QC shift matrix.
 __device__ __constant__ int8_t P[BASE_ROWS * BASE_COLS] = {
@@ -1659,176 +1370,9 @@ __device__ __constant__ int8_t P[BASE_ROWS * BASE_COLS] = {
   16,29,36,41,44,56,59,37,50,24,-1,65, 4,65,52,-1, 4,-1,73,52, 1,-1,-1, 0
 };
 
-__global__ void reconstructKernel(
-    const float* __restrict__ encoded,
-    const int* __restrict__ payloadBits,
-    const int* __restrict__ punctureBits,
-    const int* __restrict__ repeatBits,
-    float* __restrict__ beliefs,
-    float* __restrict__ messages)
-{
-    int cw = blockIdx.x;
-    int bit = threadIdx.x + blockIdx.y*blockDim.x;
-    if (cw >= kNumCodewords || bit >= N) return;
 
-    int pld = payloadBits[cw];
-    int sh = K-pld;
-    int pun = punctureBits[cw];
-    int parityAvailable = M-pun;
 
-    int inputOffset = 0;
-    for (int i = 0; i < cw; ++i) {
-        inputOffset += payloadBits[i] +
-            (M-punctureBits[i]) +
-            repeatBits[i];
-    }
 
-    float value;
-    if (bit < pld) {
-        value = encoded[inputOffset+bit];
-    } else if (bit < K) {
-        value = SHORTEN_LLR;
-    } else if (bit < K+parityAvailable) {
-        value = encoded[inputOffset+pld+(bit-K)];
-    } else {
-        value = 0.0f;
-    }
-
-    beliefs[cw*N+bit] = value;
-
-    for (int edge = bit; edge < EDGES; edge += N) {
-        messages[cw*EDGES+edge] = 0.0f;
-    }
-}
-
-__global__ void layeredNMSKernel(
-    float* __restrict__ beliefs,
-    float* __restrict__ messages)
-{
-    int cw = blockIdx.x;
-    int r = threadIdx.x;
-    if (cw >= kNumCodewords || r >= Z) return;
-
-    float* L = beliefs + cw*N;
-    float* R = messages + cw*EDGES;
-
-    for (int iter = 0; iter < kMaximumIterations; ++iter) {
-        int edgeOrdinal = 0;
-
-        for (int br = 0; br < BASE_ROWS; ++br) {
-            float min1 = FLT_MAX;
-            float min2 = FLT_MAX;
-            int minCol = -1;
-            int signProduct = 1;
-            int layerStart = edgeOrdinal;
-
-            for (int bc = 0; bc < BASE_COLS; ++bc) {
-                int shift = int(P[br*BASE_COLS+bc]);
-                if (shift < 0) continue;
-
-                int v = bc*Z + ((r+shift)%Z);
-                int edge = edgeOrdinal*Z+r;
-                float q = L[v]-R[edge];
-                float magnitude = fabsf(q);
-                int sign = q < 0.0f ? -1 : 1;
-                signProduct *= sign;
-
-                if (magnitude < min1) {
-                    min2 = min1;
-                    min1 = magnitude;
-                    minCol = bc;
-                } else if (magnitude < min2) {
-                    min2 = magnitude;
-                }
-                ++edgeOrdinal;
-            }
-
-            edgeOrdinal = layerStart;
-
-            for (int bc = 0; bc < BASE_COLS; ++bc) {
-                int shift = int(P[br*BASE_COLS+bc]);
-                if (shift < 0) continue;
-
-                int v = bc*Z + ((r+shift)%Z);
-                int edge = edgeOrdinal*Z+r;
-                float oldR = R[edge];
-                float q = L[v]-oldR;
-                int ownSign = q < 0.0f ? -1 : 1;
-                float magnitude = bc == minCol ? min2 : min1;
-                float newR = kAlpha*magnitude*
-                    float(signProduct*ownSign);
-
-                R[edge] = newR;
-                L[v] = q+newR;
-                ++edgeOrdinal;
-            }
-
-            __syncthreads();
-        }
-    }
-}
-
-__global__ void hardDecisionKernel(
-    const float* __restrict__ beliefs,
-    const int* __restrict__ payloadBits,
-    int8_t* __restrict__ decoded)
-{
-    int cw = blockIdx.x;
-    int i = threadIdx.x + blockIdx.y*blockDim.x;
-    if (cw >= kNumCodewords ||
-        i >= payloadBits[cw]) return;
-
-    int outputOffset = 0;
-    for (int c = 0; c < cw; ++c)
-        outputOffset += payloadBits[c];
-
-    decoded[outputOffset+i] =
-        beliefs[cw*N+i] < 0.0f ? int8_t(1) : int8_t(0);
-}
-
-__global__ void deriveScramblerSequenceKernel(
-    const int8_t* __restrict__ decoded,
-    int8_t* __restrict__ sequence,
-    int* __restrict__ descrambleEnabled)
-{
-    if (blockIdx.x != 0 || threadIdx.x != 0) return;
-
-    const int idx[11][7] = {
-        {0,1,2,4,6,8,10},
-        {0,1,3,5,7,9,-1},
-        {1,2,4,6,8,10,-1},
-        {0,3,5,7,9,-1,-1},
-        {1,4,6,8,10,-1,-1},
-        {0,5,7,9,-1,-1,-1},
-        {1,6,8,10,-1,-1,-1},
-        {0,7,9,-1,-1,-1,-1},
-        {1,8,10,-1,-1,-1,-1},
-        {0,9,-1,-1,-1,-1,-1},
-        {1,10,-1,-1,-1,-1,-1}
-    };
-
-    int8_t state[11];
-    int any = 0;
-
-    for (int s = 0; s < 11; ++s) {
-        int sum = 0;
-        for (int j = 0; j < 7; ++j) {
-            int index = idx[s][j];
-            if (index >= 0) sum += int(decoded[index]);
-        }
-        state[s] = int8_t(sum & 1);
-        any |= int(state[s]);
-    }
-
-    *descrambleEnabled = any ? 1 : 0;
-
-    for (int d = 0; d < 2047; ++d) {
-        int8_t bit = int8_t(state[0]^state[2]);
-        sequence[d] = bit;
-        for (int s = 0; s < 10; ++s) state[s] = state[s+1];
-        state[10] = bit;
-    }
-}
 
 __global__ void validatePayloadKernel(
     const int8_t* __restrict__ decoded,
@@ -1992,7 +1536,7 @@ __global__ void mapWeightBatchBackendKernel(const float* ext,const float* csi,co
 }
 __global__ void reconstructBatchBackendKernel(const float* enc,const int* pb,const int* pun,const int* rep,float* bel,float* msg,int batch)
 {
- int b=int(blockIdx.z),cw=int(blockIdx.x),bit=int(threadIdx.x)+int(blockIdx.y)*blockDim.x;if(b>=batch||cw>=kNumCodewords||bit>=N)return;int p=pb[cw],sh=K-p,pu=pun[cw],pa=M-pu,off=0;for(int i=0;i<cw;++i)off+=pb[i]+(M-pun[i])+rep[i];float v;if(bit<p)v=enc[size_t(b)*kEncodedLength+off+bit];else if(bit<K)v=SHORTEN_LLR;else if(bit<K+pa)v=enc[size_t(b)*kEncodedLength+off+p+(bit-K)];else v=0;bel[(size_t(b)*kNumCodewords+cw)*N+bit]=v;for(int e=bit;e<EDGES;e+=N)msg[(size_t(b)*kNumCodewords+cw)*EDGES+e]=0;
+ int b=int(blockIdx.z),cw=int(blockIdx.x),bit=int(threadIdx.x)+int(blockIdx.y)*blockDim.x;if(b>=batch||cw>=kNumCodewords||bit>=N)return;int p=pb[cw],pu=pun[cw],pa=M-pu,off=0;for(int i=0;i<cw;++i)off+=pb[i]+(M-pun[i])+rep[i];float v;if(bit<p)v=enc[size_t(b)*kEncodedLength+off+bit];else if(bit<K)v=SHORTEN_LLR;else if(bit<K+pa)v=enc[size_t(b)*kEncodedLength+off+p+(bit-K)];else v=0;bel[(size_t(b)*kNumCodewords+cw)*N+bit]=v;for(int e=bit;e<EDGES;e+=N)msg[(size_t(b)*kNumCodewords+cw)*EDGES+e]=0;
 }
 __global__ void layeredNMSBatchBackendKernel(float* bel,float* msg,int batch,int maxIterations)
 {
@@ -2041,16 +1585,6 @@ __global__ void validateBatchBackendKernel(const int8_t* dec,const int8_t* seq,c
  int i=int(blockIdx.x)*blockDim.x+threadIdx.x,b=int(blockIdx.y);if(b>=batch||i>=kPayloadBits)return;int si=16+i;int8_t v=dec[size_t(b)*kTotalDecodedBits+si];if(en[b])v=int8_t(v^seq[size_t(b)*2047+(si%2047)]);if(v)atomicAdd(cs+b,(unsigned long long)(i+1));if(v!=ref[size_t(b)*kPayloadBits+i])atomicAdd(be+b,1U);
 }
 
-__global__ void checksumBatchBackendKernel(const int8_t* dec,const int8_t* seq,const int* en,unsigned long long* cs,int batch)
-{
- int i=int(blockIdx.x)*blockDim.x+threadIdx.x,b=int(blockIdx.y);
- if(b>=batch||i>=kPayloadBits)return;
- int si=16+i;
- int8_t v=dec[size_t(b)*kTotalDecodedBits+si];
- if(en[b])v=int8_t(v^seq[size_t(b)*2047+(si%2047)]);
- if(v)atomicAdd(cs+b,(unsigned long long)(i+1));
-}
-
 double scalar(const mxArray* value,const char* name) {
     if (!mxIsNumeric(value) || mxIsComplex(value) ||
         mxGetNumberOfElements(value) != 1) {
@@ -2095,6 +1629,106 @@ int parseDataFFTStart0(const mxArray* value) {
     return first;
 }
 
+struct BatchedReceiverInput {
+    mwSize sampleCount;
+    mwSize batchSize;
+    mwSize scaleCount;
+    double llrScale;
+    int ltfFFTStart;
+    int dataFFTStart;
+};
+
+BatchedReceiverInput parseBatchedReceiverInput(const mxArray* prhs[])
+{
+    if (!mxIsInt16(prhs[1]) || mxIsComplex(prhs[1]) ||
+        !mxIsInt16(prhs[2]) || mxIsComplex(prhs[2]))
+        mexErrMsgIdAndTxt(
+            "eht_receiver_cuda_e2e:Input",
+            "RxI/RxQ must be real int16 matrices.");
+
+    BatchedReceiverInput input{};
+    input.sampleCount = mxGetM(prhs[1]);
+    input.batchSize = mxGetN(prhs[1]);
+    input.scaleCount = mxGetNumberOfElements(prhs[3]);
+
+    if (input.sampleCount < kPacketLengthSamples ||
+        input.batchSize < 1 ||
+        mxGetM(prhs[2]) != input.sampleCount ||
+        mxGetN(prhs[2]) != input.batchSize)
+        mexErrMsgIdAndTxt(
+            "eht_receiver_cuda_e2e:Input",
+            "RxI/RxQ must be [samples x batch].");
+
+    if (input.scaleCount != 1 &&
+        input.scaleCount != input.batchSize)
+        mexErrMsgIdAndTxt(
+            "eht_receiver_cuda_e2e:Input",
+            "RxScale must be scalar or one value per packet.");
+
+    input.llrScale = scalar(prhs[4],"llrScale");
+    if (!(input.llrScale > 0.0))
+        mexErrMsgIdAndTxt(
+            "eht_receiver_cuda_e2e:Input",
+            "llrScale must be positive.");
+
+    if (!mxIsSingle(prhs[5]) ||
+        !mxIsComplex(prhs[5]) ||
+        mxGetNumberOfElements(prhs[5]) != 2560)
+        mexErrMsgIdAndTxt(
+            "eht_receiver_cuda_e2e:Input",
+            "L-LTF reference must be complex single, 2560 samples.");
+
+    input.ltfFFTStart = int(scalar(prhs[8],"ltfFFTStart"))-1;
+    if (input.ltfFFTStart < 0 ||
+        input.ltfFFTStart+kFFTLength > kEHTLTFLength)
+        mexErrMsgIdAndTxt(
+            "eht_receiver_cuda_e2e:Input",
+            "Invalid ltfFFTStart.");
+
+    input.dataFFTStart = parseDataFFTStart0(prhs[9]);
+    return input;
+}
+
+void copyInverseScales(
+    const mxArray* scales,mwSize scaleCount,
+    mwSize batchSize,float* destination)
+{
+    for (mwSize b = 0; b < batchSize; ++b) {
+        double value;
+        if (mxIsDouble(scales))
+            value = mxGetDoubles(scales)[scaleCount == 1 ? 0 : b];
+        else if (mxIsSingle(scales))
+            value = double(
+                mxGetSingles(scales)[scaleCount == 1 ? 0 : b]);
+        else
+            value = scalar(scales,"RxScale");
+
+        if (!(value > 0.0))
+            mexErrMsgIdAndTxt(
+                "eht_receiver_cuda_e2e:Input",
+                "RxScale must be positive.");
+
+        destination[b] = float(1.0/value);
+    }
+}
+
+float copyLLTFReference(
+    const mxArray* reference,cufftComplex* destination)
+{
+    const mxComplexSingle* source = mxGetComplexSingles(reference);
+    double energy = 0.0;
+
+    for (int i = 0; i < 2560; ++i) {
+        destination[i] =
+            cufftComplex{source[i].real,source[i].imag};
+        energy +=
+            double(source[i].real)*double(source[i].real) +
+            double(source[i].imag)*double(source[i].imag);
+    }
+
+    return float(energy);
+}
+
 std::string commandString(const mxArray* value) {
     if (!mxIsChar(value))
         mexErrMsgIdAndTxt(
@@ -2112,15 +1746,18 @@ std::string commandString(const mxArray* value) {
     return command;
 }
 
-void validateCellCount(const mxArray* value,const char* name) {
-    if (!mxIsCell(value) ||
-        mxGetNumberOfElements(value) != kNumSegments) {
-        mexErrMsgIdAndTxt(
-            "eht_receiver_cuda_async:Input",
-            "%s must be a four-element cell array.",name);
-    }
-}
+void removeStructField(mxArray* value,const char* name)
+{
+    const int fieldNumber = mxGetFieldNumber(value,name);
+    if (fieldNumber < 0)
+        return;
 
+    mxArray* fieldValue =
+        mxGetFieldByNumber(value,0,fieldNumber);
+    mxRemoveField(value,fieldNumber);
+    if (fieldValue)
+        mxDestroyArray(fieldValue);
+}
 
 void copyComplexSingleWindow(
     const mxArray* input,
@@ -2575,7 +2212,6 @@ void coarseCFOCommand(
     constexpr int lag = 256;
     constexpr int pairCount = lSTFLength-lag;
     constexpr float sampleRateHz = 320.0e6f;
-    constexpr float twoPi = 6.2831853071795864769f;
 
     const size_t iqBytes = size_t(count)*sizeof(int16_t);
     const size_t waveformBytes = size_t(count)*sizeof(cufftComplex);
@@ -3191,6 +2827,119 @@ void part7Command(
     }
 }
 
+void launchSinglePacketBackend(
+    Slot& slot,float noiseVariance,float llrScale,int validationMode)
+{
+    CUDA_CHECK(cudaMemcpy(
+        slot.dNoiseVariance,&noiseVariance,sizeof(float),
+        cudaMemcpyHostToDevice));
+
+    CUFFT_CHECK(cufftExecC2C(
+        slot.ltfPlan,slot.dLTFInput,
+        slot.dLTFOutput,CUFFT_FORWARD));
+    CUFFT_CHECK(cufftExecC2C(
+        slot.dataPlan,slot.dDataInput,
+        slot.dDataOutput,CUFFT_FORWARD));
+
+    constexpr int threads = 256;
+    dim3 activeGrid((kActiveToneCount+threads-1)/threads,1);
+    extractActiveBatchBackendKernel<<<
+        activeGrid,threads,0,slot.stream>>>(
+            slot.dLTFOutput,slot.dDataOutput,
+            sharedData.ltfFFTIndices,sharedData.dataFFTIndices,
+            slot.dLTFActive,slot.dDataActive,1);
+    CUDA_CHECK(cudaGetLastError());
+
+    estimateChannelBatchBackendKernel<<<
+        activeGrid,threads,0,slot.stream>>>(
+            slot.dLTFActive,sharedData.knownLTF,
+            slot.dChannelEstimate,1);
+    CUDA_CHECK(cudaGetLastError());
+
+    pilotRotationBatchBackendKernel<<<
+        kNumDataSymbols,threads,
+        threads*sizeof(cufftComplex),slot.stream>>>(
+            slot.dDataActive,slot.dChannelEstimate,
+            sharedData.pilotIndices,sharedData.pilotReference,
+            sharedData.pilotCount,slot.dPilotRotation,1);
+    CUDA_CHECK(cudaGetLastError());
+
+    dim3 equalizeGrid(
+        (kActiveToneCount*kNumDataSymbols+threads-1)/threads,1);
+    equalizeBatchBackendKernel<<<
+        equalizeGrid,threads,0,slot.stream>>>(
+            slot.dDataActive,slot.dChannelEstimate,
+            slot.dPilotRotation,slot.dNoiseVariance,
+            slot.dEqualizedActive,1);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaEventRecord(slot.afterFrontend,slot.stream));
+
+    qamFP32BatchBackendKernel<<<
+        (kTotalSymbols+threads-1)/threads,threads,0,slot.stream>>>(
+            slot.dEqualizedActive,slot.dChannelEstimate,
+            sharedData.dataIndices,slot.dExternalLLR,
+            slot.dCSI,slot.dNoiseVariance,1);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaEventRecord(slot.afterDemap,slot.stream));
+
+    mapWeightBatchBackendKernel<<<
+        (kEncodedLength+threads-1)/threads,threads,0,slot.stream>>>(
+            slot.dExternalLLR,slot.dCSI,
+            sharedData.encodedSourceIndex,1.0f/llrScale,
+            slot.dEncoded,1);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaEventRecord(slot.afterMap,slot.stream));
+
+    dim3 reconstructGrid(
+        kNumCodewords,(N+threads-1)/threads,1);
+    reconstructBatchBackendKernel<<<
+        reconstructGrid,threads,0,slot.stream>>>(
+            slot.dEncoded,sharedData.payloadBits,
+            sharedData.punctureBits,sharedData.repeatBits,
+            slot.dBeliefs,slot.dMessages,1);
+    CUDA_CHECK(cudaGetLastError());
+
+    dim3 ldpcGrid(kNumCodewords,1);
+    layeredNMSBatchBackendKernel<<<
+        ldpcGrid,Z,0,slot.stream>>>(
+            slot.dBeliefs,slot.dMessages,1,
+            kProductionLDPCIterations);
+    CUDA_CHECK(cudaGetLastError());
+
+    dim3 decisionGrid(
+        kNumCodewords,(K+threads-1)/threads,1);
+    hardDecisionBatchBackendKernel<<<
+        decisionGrid,threads,0,slot.stream>>>(
+            slot.dBeliefs,sharedData.payloadBits,
+            slot.dDecoded,1);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaEventRecord(slot.afterLDPC,slot.stream));
+
+    deriveScramblerBatchBackendKernel<<<1,1,0,slot.stream>>>(
+        slot.dDecoded,slot.dScrambleSequence,
+        slot.dDescrambleEnabled,1);
+    CUDA_CHECK(cudaGetLastError());
+
+    validatePayloadKernel<<<
+        (kPayloadBits+threads-1)/threads,
+        threads,0,slot.stream>>>(
+            slot.dDecoded,slot.dScrambleSequence,
+            slot.dDescrambleEnabled,validationMode,
+            slot.dReferenceBits,slot.dChecksum,slot.dBitErrors);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaEventRecord(slot.afterValidate,slot.stream));
+
+    CUDA_CHECK(cudaMemcpyAsync(
+        slot.hChecksum,slot.dChecksum,
+        sizeof(unsigned long long),
+        cudaMemcpyDeviceToHost,slot.stream));
+    CUDA_CHECK(cudaMemcpyAsync(
+        slot.hBitErrors,slot.dBitErrors,
+        sizeof(unsigned int),
+        cudaMemcpyDeviceToHost,slot.stream));
+    CUDA_CHECK(cudaEventRecord(slot.done,slot.stream));
+}
+
 
 void e2eCommand(
     int nlhs,mxArray* plhs[],int nrhs,const mxArray* prhs[])
@@ -3473,104 +3222,8 @@ void e2eCommand(
             cudaMemcpyDeviceToDevice,slot->stream));
     }
 
-    CUFFT_CHECK(cufftExecC2C(
-        slot->ltfPlan,slot->dLTFInput,
-        slot->dLTFOutput,CUFFT_FORWARD));
-    CUFFT_CHECK(cufftExecC2C(
-        slot->dataPlan,slot->dDataInput,
-        slot->dDataOutput,CUFFT_FORWARD));
-
-    int blocks = (kActiveToneCount+threads-1)/threads;
-    extractActiveKernel<<<blocks,threads,0,slot->stream>>>(
-        slot->dLTFOutput,slot->dDataOutput,
-        sharedData.ltfFFTIndices,sharedData.dataFFTIndices,
-        slot->dLTFActive,slot->dDataActive);
-    CUDA_CHECK(cudaGetLastError());
-
-    estimateChannelKernel<<<blocks,threads,0,slot->stream>>>(
-        slot->dLTFActive,sharedData.knownLTF,
-        slot->dChannelEstimate);
-    CUDA_CHECK(cudaGetLastError());
-
-    estimatePilotRotationKernel<<<
-        kNumDataSymbols,256,256*sizeof(cufftComplex),slot->stream>>>(
-            slot->dDataActive,slot->dChannelEstimate,
-            sharedData.pilotIndices,sharedData.pilotReference,
-            sharedData.pilotCount,slot->dPilotRotation);
-    CUDA_CHECK(cudaGetLastError());
-
-    blocks = (kActiveToneCount*kNumDataSymbols+threads-1)/threads;
-    equalizeKernel<<<blocks,threads,0,slot->stream>>>(
-        slot->dDataActive,slot->dChannelEstimate,
-        slot->dPilotRotation,noiseVariance,
-        slot->dEqualizedActive);
-    CUDA_CHECK(cudaGetLastError());
-
-    segmentQuantizeCSIKernel<<<4,256,0,slot->stream>>>(
-        slot->dEqualizedActive,slot->dChannelEstimate,
-        sharedData.dataIndices,noiseVariance,
-        slot->dI,slot->dQ,slot->dCSI,
-        slot->dInverseQuantScales);
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaEventRecord(slot->afterFrontend,slot->stream));
-
-    blocks = (kTotalSymbols+threads-1)/threads;
-    qam4096DemapKernel<<<blocks,threads,0,slot->stream>>>(
-        slot->dI,slot->dQ,slot->dExternalLLR,kTotalSymbols,
-        slot->dInverseQuantScales,float(1.0/noiseVariance),
-        float(llrScale));
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaEventRecord(slot->afterDemap,slot->stream));
-
-    blocks = (kEncodedLength+threads-1)/threads;
-    mapWeightKernel<<<blocks,threads,0,slot->stream>>>(
-        slot->dExternalLLR,slot->dCSI,
-        sharedData.encodedSourceIndex,float(1.0/llrScale),
-        slot->dEncoded);
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaEventRecord(slot->afterMap,slot->stream));
-
-    dim3 reconBlock(256);
-    dim3 reconGrid(kNumCodewords,(N+reconBlock.x-1)/reconBlock.x);
-    reconstructKernel<<<reconGrid,reconBlock,0,slot->stream>>>(
-        slot->dEncoded,sharedData.payloadBits,
-        sharedData.punctureBits,sharedData.repeatBits,
-        slot->dBeliefs,slot->dMessages);
-    CUDA_CHECK(cudaGetLastError());
-
-    layeredNMSKernel<<<kNumCodewords,128,0,slot->stream>>>(
-        slot->dBeliefs,slot->dMessages);
-    CUDA_CHECK(cudaGetLastError());
-
-    dim3 decisionBlock(256);
-    dim3 decisionGrid(kNumCodewords,(K+decisionBlock.x-1)/decisionBlock.x);
-    hardDecisionKernel<<<decisionGrid,decisionBlock,0,slot->stream>>>(
-        slot->dBeliefs,sharedData.payloadBits,slot->dDecoded);
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaEventRecord(slot->afterLDPC,slot->stream));
-
-    deriveScramblerSequenceKernel<<<1,1,0,slot->stream>>>(
-        slot->dDecoded,slot->dScrambleSequence,
-        slot->dDescrambleEnabled);
-    CUDA_CHECK(cudaGetLastError());
-
-    blocks = (kPayloadBits+threads-1)/threads;
-    validatePayloadKernel<<<blocks,threads,0,slot->stream>>>(
-        slot->dDecoded,slot->dScrambleSequence,
-        slot->dDescrambleEnabled,1,
-        slot->dReferenceBits,slot->dChecksum,slot->dBitErrors);
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaEventRecord(slot->afterValidate,slot->stream));
-
-    CUDA_CHECK(cudaMemcpyAsync(
-        slot->hChecksum,slot->dChecksum,
-        sizeof(unsigned long long),
-        cudaMemcpyDeviceToHost,slot->stream));
-    CUDA_CHECK(cudaMemcpyAsync(
-        slot->hBitErrors,slot->dBitErrors,
-        sizeof(unsigned int),
-        cudaMemcpyDeviceToHost,slot->stream));
-    CUDA_CHECK(cudaEventRecord(slot->done,slot->stream));
+    launchSinglePacketBackend(
+        *slot,noiseVariance,float(llrScale),1);
     CUDA_CHECK(cudaEventSynchronize(slot->done));
 
     CUDA_CHECK(cudaFree(dEHTData));
@@ -3617,211 +3270,270 @@ void batchFrontendCommand(int nlhs,mxArray* plhs[],int nrhs,const mxArray* prhs[
     cudaFree(dD);cudaFree(dL);cudaFree(dN);cudaFree(dFC);cudaFree(dFinal);cudaFree(dCorr);cudaFree(dMet);cudaFree(dCC);cudaFree(dOff);cudaFree(dInv);cudaFree(dRef);cudaFree(dW);cudaFree(dQ);cudaFree(dI);if(nlhs==1)plhs[0]=out;else mxDestroyArray(out);
 }
 
+BatchedSlot* findBatchedTicket(uint64_t ticket);
+void prepareBatchedSlots(mwSize sampleCount,mwSize batchCapacity);
+void e2eBatchSubmitCommand(
+    int nlhs,mxArray* plhs[],int nrhs,const mxArray* prhs[]);
 
-void e2eBatchCommand(int nlhs,mxArray* plhs[],int nrhs,const mxArray* prhs[])
+void e2eBatchCommand(
+    int nlhs,mxArray* plhs[],int nrhs,const mxArray* prhs[])
 {
-    if(nrhs!=15) mexErrMsgIdAndTxt("eht_receiver_cuda_e2e:InputCount","e2eBatch expects command plus 14 inputs.");
-    if(nlhs>1) mexErrMsgIdAndTxt("eht_receiver_cuda_e2e:OutputCount","e2eBatch returns one batch validation structure.");
-    if(!mxIsInt16(prhs[1])||mxIsComplex(prhs[1])||!mxIsInt16(prhs[2])||mxIsComplex(prhs[2])) mexErrMsgIdAndTxt("eht_receiver_cuda_e2e:Input","RxI/RxQ must be real int16 matrices.");
-    mwSize count=mxGetM(prhs[1]),batch=mxGetN(prhs[1]);if(count<kPacketLengthSamples||batch<1||mxGetM(prhs[2])!=count||mxGetN(prhs[2])!=batch) mexErrMsgIdAndTxt("eht_receiver_cuda_e2e:Input","RxI/RxQ must be [samples x batch].");
-    mwSize scn=mxGetNumberOfElements(prhs[3]);if(scn!=1&&scn!=batch) mexErrMsgIdAndTxt("eht_receiver_cuda_e2e:Input","RxScale must be scalar or one value per packet.");
-    double llrScale=scalar(prhs[4],"llrScale");if(!(llrScale>0))mexErrMsgIdAndTxt("eht_receiver_cuda_e2e:Input","llrScale must be positive.");
-    if(!mxIsSingle(prhs[5])||!mxIsComplex(prhs[5])||mxGetNumberOfElements(prhs[5])!=2560) mexErrMsgIdAndTxt("eht_receiver_cuda_e2e:Input","L-LTF reference must be complex single, 2560 samples.");
-    int ltfStart=int(scalar(prhs[8],"ltfFFTStart"))-1;if(ltfStart<0||ltfStart+kFFTLength>kEHTLTFLength)mexErrMsgIdAndTxt("eht_receiver_cuda_e2e:Input","Invalid ltfFFTStart.");
-    int d0=parseDataFFTStart0(prhs[9]);
-    if(mxGetM(prhs[14])!=kPayloadBits||(mxGetN(prhs[14])!=1&&mxGetN(prhs[14])!=batch)||!(mxIsInt8(prhs[14])||mxIsLogical(prhs[14]))) mexErrMsgIdAndTxt("eht_receiver_cuda_e2e:Input","referencePayloadBits must be [%d x 1] or [%d x batch].",kPayloadBits,kPayloadBits);
-    ensureInitialized();initializeFrontendMetadata(prhs[6],prhs[7],prhs[10],prhs[11],prhs[12],prhs[13]);
-    std::vector<float> inv(batch);for(mwSize b=0;b<batch;++b){double v=mxIsDouble(prhs[3])?mxGetDoubles(prhs[3])[scn==1?0:b]:mxIsSingle(prhs[3])?double(mxGetSingles(prhs[3])[scn==1?0:b]):scalar(prhs[3],"RxScale");if(!(v>0))mexErrMsgIdAndTxt("eht_receiver_cuda_e2e:Input","RxScale must be positive.");inv[b]=float(1.0/v);}
-    const mxComplexSingle* hr=mxGetComplexSingles(prhs[5]);std::vector<cufftComplex> tref(2560);double er=0;for(int i=0;i<2560;++i){tref[i]={hr[i].real,hr[i].imag};er+=double(hr[i].real)*hr[i].real+double(hr[i].imag)*hr[i].imag;}float refE=float(er);
-    std::vector<int8_t> href(size_t(batch)*kPayloadBits);mwSize rc=mxGetN(prhs[14]);if(mxIsInt8(prhs[14])){const int8_t*p=(const int8_t*)mxGetData(prhs[14]);for(mwSize b=0;b<batch;++b)std::memcpy(href.data()+size_t(b)*kPayloadBits,p+size_t(rc==1?0:b)*kPayloadBits,kPayloadBits);}else{const mxLogical*p=mxGetLogicals(prhs[14]);for(mwSize b=0;b<batch;++b)for(int i=0;i<kPayloadBits;++i)href[size_t(b)*kPayloadBits+i]=p[size_t(rc==1?0:b)*kPayloadBits+i]?1:0;}
-    size_t total=size_t(count)*batch;int16_t *ri=nullptr,*rq=nullptr,*qi=nullptr,*qq=nullptr;cufftComplex *w=nullptr,*tr=nullptr,*lf=nullptr,*df=nullptr,*li=nullptr,*lo=nullptr,*di=nullptr,*doo=nullptr,*la=nullptr,*da=nullptr,*ch=nullptr,*rot=nullptr,*eq=nullptr;float *is=nullptr,*cc=nullptr,*met=nullptr,*fc=nullptr,*nv=nullptr,*csi=nullptr,*invq=nullptr,*enc=nullptr,*bel=nullptr,*msg=nullptr;int *off=nullptr,*corr=nullptr,*fin=nullptr,*den=nullptr;float *ellr=nullptr;int8_t *dec=nullptr,*seq=nullptr,*dref=nullptr;unsigned long long*cs=nullptr;unsigned int*be=nullptr;cufftHandle lp=0,dp=0;
-    auto cm=[&](void**p,size_t n){CUDA_CHECK(cudaMalloc(p,n));};cm((void**)&ri,total*sizeof(int16_t));cm((void**)&rq,total*sizeof(int16_t));cm((void**)&w,total*sizeof(cufftComplex));cm((void**)&tr,2560*sizeof(cufftComplex));cm((void**)&is,batch*sizeof(float));cm((void**)&off,batch*sizeof(int));cm((void**)&cc,batch*sizeof(float));cm((void**)&met,size_t(batch)*513*sizeof(float));cm((void**)&corr,batch*sizeof(int));cm((void**)&fin,batch*sizeof(int));cm((void**)&fc,batch*sizeof(float));cm((void**)&nv,batch*sizeof(float));cm((void**)&lf,size_t(batch)*kEHTLTFLength*sizeof(cufftComplex));cm((void**)&df,size_t(batch)*kEHTDataLength*sizeof(cufftComplex));cm((void**)&li,size_t(batch)*kFFTLength*sizeof(cufftComplex));cm((void**)&lo,size_t(batch)*kFFTLength*sizeof(cufftComplex));cm((void**)&di,size_t(batch)*kDataInputCount*sizeof(cufftComplex));cm((void**)&doo,size_t(batch)*kDataInputCount*sizeof(cufftComplex));cm((void**)&la,size_t(batch)*kActiveToneCount*sizeof(cufftComplex));cm((void**)&da,size_t(batch)*kActiveToneCount*kNumDataSymbols*sizeof(cufftComplex));cm((void**)&ch,size_t(batch)*kActiveToneCount*sizeof(cufftComplex));cm((void**)&rot,size_t(batch)*kNumDataSymbols*sizeof(cufftComplex));cm((void**)&eq,size_t(batch)*kActiveToneCount*kNumDataSymbols*sizeof(cufftComplex));cm((void**)&qi,size_t(batch)*kTotalSymbols*sizeof(int16_t));cm((void**)&qq,size_t(batch)*kTotalSymbols*sizeof(int16_t));cm((void**)&csi,size_t(batch)*kDataToneCount*sizeof(float));cm((void**)&invq,size_t(batch)*kNumSegments*sizeof(float));cm((void**)&ellr,size_t(batch)*kTotalSymbols*kBitsPerSymbol*sizeof(float));cm((void**)&enc,size_t(batch)*kEncodedLength*sizeof(float));cm((void**)&bel,size_t(batch)*kNumCodewords*N*sizeof(float));cm((void**)&msg,size_t(batch)*kNumCodewords*EDGES*sizeof(float));cm((void**)&dec,size_t(batch)*kTotalDecodedBits*sizeof(int8_t));cm((void**)&seq,size_t(batch)*2047*sizeof(int8_t));cm((void**)&den,batch*sizeof(int));cm((void**)&dref,size_t(batch)*kPayloadBits*sizeof(int8_t));cm((void**)&cs,batch*sizeof(unsigned long long));cm((void**)&be,batch*sizeof(unsigned int));
-    CUDA_CHECK(cudaMemcpy(ri,mxGetData(prhs[1]),total*sizeof(int16_t),cudaMemcpyHostToDevice));CUDA_CHECK(cudaMemcpy(rq,mxGetData(prhs[2]),total*sizeof(int16_t),cudaMemcpyHostToDevice));CUDA_CHECK(cudaMemcpy(tr,tref.data(),2560*sizeof(cufftComplex),cudaMemcpyHostToDevice));CUDA_CHECK(cudaMemcpy(is,inv.data(),batch*sizeof(float),cudaMemcpyHostToDevice));CUDA_CHECK(cudaMemcpy(dref,href.data(),size_t(batch)*kPayloadBits*sizeof(int8_t),cudaMemcpyHostToDevice));std::vector<int> init(batch,int(count));CUDA_CHECK(cudaMemcpy(off,init.data(),batch*sizeof(int),cudaMemcpyHostToDevice));CUDA_CHECK(cudaMemset(cs,0,batch*sizeof(unsigned long long)));CUDA_CHECK(cudaMemset(be,0,batch*sizeof(unsigned int)));
-   
-   
-   
-   // STEP 7: fine-grained GPU front-end profiling using CUDA events.
-    // These events are recorded in the same CUDA stream (default stream here),
-    // so elapsed times measure actual device execution rather than host launch time.
+    if (nrhs != 15)
+        mexErrMsgIdAndTxt(
+            "eht_receiver_cuda_e2e:InputCount",
+            "e2eBatch expects command plus 14 inputs.");
+    if (nlhs > 1)
+        mexErrMsgIdAndTxt(
+            "eht_receiver_cuda_e2e:OutputCount",
+            "e2eBatch returns one batch validation structure.");
 
+    const BatchedReceiverInput input = parseBatchedReceiverInput(prhs);
+    const mwSize batch = input.batchSize;
+    const mxArray* referenceBits = prhs[14];
+    const mwSize referenceColumns = mxGetN(referenceBits);
 
-    cudaEvent_t evPacketDetectStart=nullptr, evPacketDetectEnd=nullptr;
-    cudaEvent_t evCoarseCFOEnd=nullptr, evTimingSyncEnd=nullptr, evFineCFOEnd=nullptr;
-    CUDA_CHECK(cudaEventCreate(&evPacketDetectStart));
-    CUDA_CHECK(cudaEventCreate(&evPacketDetectEnd));
-    CUDA_CHECK(cudaEventCreate(&evCoarseCFOEnd));
-    CUDA_CHECK(cudaEventCreate(&evTimingSyncEnd));
-    CUDA_CHECK(cudaEventCreate(&evFineCFOEnd));
+    if (mxGetM(referenceBits) != kPayloadBits ||
+        (referenceColumns != 1 && referenceColumns != batch) ||
+        !(mxIsInt8(referenceBits) || mxIsLogical(referenceBits)))
+        mexErrMsgIdAndTxt(
+            "eht_receiver_cuda_e2e:Input",
+            "referencePayloadBits must be [%d x 1] or [%d x batch].",
+            kPayloadBits,kPayloadBits);
 
-    int th=256;
-    dim3 sg((int(count)+th-1)/th,(unsigned)batch);
-    reconstructWaveformBatchKernel<<<sg,th>>>(ri,rq,w,is,int(count),int(batch));
+    std::vector<int8_t> hostReference(size_t(batch)*kPayloadBits);
+    if (mxIsInt8(referenceBits)) {
+        const int8_t* source =
+            static_cast<const int8_t*>(mxGetData(referenceBits));
+        for (mwSize b = 0; b < batch; ++b) {
+            const int8_t* packet =
+                source+size_t(referenceColumns == 1 ? 0 : b)*kPayloadBits;
+            for (int i = 0; i < kPayloadBits; ++i) {
+                if (packet[i] != 0 && packet[i] != 1)
+                    mexErrMsgIdAndTxt(
+                        "eht_receiver_cuda_e2e:Input",
+                        "referencePayloadBits must contain only 0 or 1.");
+                hostReference[size_t(b)*kPayloadBits+i] = packet[i];
+            }
+        }
+    } else {
+        const mxLogical* source = mxGetLogicals(referenceBits);
+        for (mwSize b = 0; b < batch; ++b) {
+            const mxLogical* packet =
+                source+size_t(referenceColumns == 1 ? 0 : b)*kPayloadBits;
+            for (int i = 0; i < kPayloadBits; ++i)
+                hostReference[size_t(b)*kPayloadBits+i] =
+                    packet[i] ? int8_t(1) : int8_t(0);
+        }
+    }
+
+    // Run the same persistent pipeline used by the timed asynchronous path.
+    prepareBatchedSlots(input.sampleCount,batch);
+    mxArray* submitOutputs[] = {nullptr};
+    e2eBatchSubmitCommand(1,submitOutputs,14,prhs);
+    mxArray* ticketArray = submitOutputs[0];
+    const uint64_t ticket =
+        static_cast<uint64_t>(mxGetScalar(ticketArray));
+    BatchedSlot* slot = findBatchedTicket(ticket);
+    mxDestroyArray(ticketArray);
+
+    if (!slot)
+        mexErrMsgIdAndTxt(
+            "eht_receiver_cuda_e2e:Internal",
+            "Submitted validation batch has no active slot.");
+
+    CUDA_CHECK(cudaEventSynchronize(slot->done));
+
+    // Validation is the only extra GPU work. The receiver intermediates remain
+    // resident in the persistent slot and are copied out only for diagnostics.
+    int8_t* deviceReference = nullptr;
+    unsigned long long* deviceChecksums = nullptr;
+    unsigned int* deviceBitErrors = nullptr;
+    const size_t referenceBytes =
+        size_t(batch)*kPayloadBits*sizeof(int8_t);
+    CUDA_CHECK(cudaMalloc(
+        reinterpret_cast<void**>(&deviceReference),referenceBytes));
+    CUDA_CHECK(cudaMalloc(
+        reinterpret_cast<void**>(&deviceChecksums),
+        size_t(batch)*sizeof(unsigned long long)));
+    CUDA_CHECK(cudaMalloc(
+        reinterpret_cast<void**>(&deviceBitErrors),
+        size_t(batch)*sizeof(unsigned int)));
+    CUDA_CHECK(cudaMemcpy(
+        deviceReference,hostReference.data(),referenceBytes,
+        cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemset(
+        deviceChecksums,0,size_t(batch)*sizeof(unsigned long long)));
+    CUDA_CHECK(cudaMemset(
+        deviceBitErrors,0,size_t(batch)*sizeof(unsigned int)));
+
+    constexpr int threads = 256;
+    dim3 validationGrid(
+        (kPayloadBits+threads-1)/threads,(unsigned)batch);
+    validateBatchBackendKernel<<<
+        validationGrid,threads,0,slot->stream>>>(
+            slot->dDecoded,slot->dScrambleSequence,
+            slot->dDescrambleEnabled,deviceReference,
+            deviceChecksums,deviceBitErrors,int(batch));
     CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaStreamSynchronize(slot->stream));
 
-    // Stage 1: Packet Detection. INT16->FP32 reconstruction is intentionally
-    // outside the locked 12 receiver stages.
+    std::vector<unsigned long long> hostChecksums(batch);
+    std::vector<unsigned int> hostBitErrors(batch);
+    std::vector<int> hostOffsets(batch),hostFinalOffsets(batch);
+    std::vector<float> hostCoarseCFO(batch),hostFineCFO(batch);
+    std::vector<float> hostNoise(batch);
+    std::vector<cufftComplex> hostChannel(
+        size_t(batch)*kActiveToneCount);
+    std::vector<cufftComplex> hostEqualized(
+        size_t(batch)*kActiveToneCount*kNumDataSymbols);
+    std::vector<float> hostCSI(size_t(batch)*kDataToneCount);
+    std::vector<float> hostEncoded(size_t(batch)*kEncodedLength);
 
+    CUDA_CHECK(cudaMemcpy(
+        hostChecksums.data(),deviceChecksums,
+        size_t(batch)*sizeof(unsigned long long),
+        cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(
+        hostBitErrors.data(),deviceBitErrors,
+        size_t(batch)*sizeof(unsigned int),
+        cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(
+        hostOffsets.data(),slot->dDetectedOffsets,
+        size_t(batch)*sizeof(int),cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(
+        hostFinalOffsets.data(),slot->dFinalOffsets,
+        size_t(batch)*sizeof(int),cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(
+        hostCoarseCFO.data(),slot->dCoarseCFO,
+        size_t(batch)*sizeof(float),cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(
+        hostFineCFO.data(),slot->dFineCFO,
+        size_t(batch)*sizeof(float),cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(
+        hostNoise.data(),slot->dNoiseVariance,
+        size_t(batch)*sizeof(float),cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(
+        hostChannel.data(),slot->dChannelEstimate,
+        hostChannel.size()*sizeof(cufftComplex),
+        cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(
+        hostEqualized.data(),slot->dEqualized,
+        hostEqualized.size()*sizeof(cufftComplex),
+        cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(
+        hostCSI.data(),slot->dCSI,
+        hostCSI.size()*sizeof(float),cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(
+        hostEncoded.data(),slot->dEncoded,
+        hostEncoded.size()*sizeof(float),cudaMemcpyDeviceToHost));
 
-    CUDA_CHECK(cudaEventRecord(evPacketDetectStart));
-    dim3 dg((int(count)-512+1+th-1)/th,(unsigned)batch);
-    packetDetectBatchKernel<<<dg,th>>>(w,int(count),off,int(batch));
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaEventRecord(evPacketDetectEnd));
+    CUDA_CHECK(cudaFree(deviceBitErrors));
+    CUDA_CHECK(cudaFree(deviceChecksums));
+    CUDA_CHECK(cudaFree(deviceReference));
 
-    // Stage 2: Coarse CFO = estimation + correction.
-    coarseCFOBatchKernel<<<int(batch),th>>>(w,off,int(count),cc,int(batch));
-    CUDA_CHECK(cudaGetLastError());
-    cfoCorrectBatchKernel<<<sg,th>>>(w,off,int(count),cc,int(batch));
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaEventRecord(evCoarseCFOEnd));
-
-    // Stage 3: Timing Synchronization = timing metric/argmax + rebase to the
-    // final packet boundary.
-    dim3 tg((513+th-1)/th,(unsigned)batch);
-    timingMetricBatchKernel<<<tg,th>>>(w,tr,off,int(count),refE,met,int(batch));
-    CUDA_CHECK(cudaGetLastError());
-    timingArgMaxBatchKernel<<<int(batch),1>>>(met,off,corr,fin,int(batch));
-    CUDA_CHECK(cudaGetLastError());
-    rebaseBatchKernel<<<sg,th>>>(w,fin,corr,int(count),cc,int(batch));
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaEventRecord(evTimingSyncEnd));
-
-    // Stage 4: Fine CFO = estimation + correction.
-    fineCFOBatchKernel<<<int(batch),th>>>(w,fin,int(count),fc,int(batch));
-    CUDA_CHECK(cudaGetLastError());
-    cfoCorrectBatchKernel<<<sg,th>>>(w,fin,int(count),fc,int(batch));
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaEventRecord(evFineCFOEnd));
-
-    // Noise estimation and field extraction are currently outside the locked
-    // four Step-7 timing categories.
-    noiseBatchKernel<<<int(batch),th>>>(w,fin,int(count),nv,int(batch));
-    CUDA_CHECK(cudaGetLastError());
-    dim3 eg((kEHTDataLength+th-1)/th,(unsigned)batch);
-    extractFieldsBatchKernel<<<eg,th>>>(w,fin,int(count),lf,df,int(batch));
-    CUDA_CHECK(cudaGetLastError());
-    dim3 gg((kFFTLength+th-1)/th,(unsigned)batch);gatherFFTWindowsBatchKernel<<<gg,th>>>(lf,df,li,di,ltfStart,d0,int(batch));CUDA_CHECK(cudaGetLastError());int n[1]={kFFTLength},emb[1]={kFFTLength};CUFFT_CHECK(cufftPlanMany(&lp,1,n,emb,1,kFFTLength,emb,1,kFFTLength,CUFFT_C2C,int(batch)));CUFFT_CHECK(cufftPlanMany(&dp,1,n,emb,1,kFFTLength,emb,1,kFFTLength,CUFFT_C2C,int(batch)*kNumDataSymbols));CUFFT_CHECK(cufftExecC2C(lp,li,lo,CUFFT_FORWARD));CUFFT_CHECK(cufftExecC2C(dp,di,doo,CUFFT_FORWARD));
-    dim3 ag((kActiveToneCount+th-1)/th,(unsigned)batch);extractActiveBatchBackendKernel<<<ag,th>>>(lo,doo,sharedData.ltfFFTIndices,sharedData.dataFFTIndices,la,da,int(batch));estimateChannelBatchBackendKernel<<<ag,th>>>(la,sharedData.knownLTF,ch,int(batch));pilotRotationBatchBackendKernel<<<int(batch)*kNumDataSymbols,256,256*sizeof(cufftComplex)>>>(da,ch,sharedData.pilotIndices,sharedData.pilotReference,sharedData.pilotCount,rot,int(batch));dim3 eqg((kActiveToneCount*kNumDataSymbols+th-1)/th,(unsigned)batch);equalizeBatchBackendKernel<<<eqg,th>>>(da,ch,rot,nv,eq,int(batch));int bt=int(batch)*kTotalSymbols; qamFP32BatchBackendKernel<<<(bt+th-1)/th,th>>>(eq,ch,sharedData.dataIndices,ellr,csi,nv,int(batch));int beN=int(batch)*kEncodedLength;mapWeightBatchBackendKernel<<<(beN+th-1)/th,th>>>(ellr,csi,sharedData.encodedSourceIndex,float(1.0/llrScale),enc,int(batch));dim3 rg(kNumCodewords,(N+th-1)/th,(unsigned)batch);reconstructBatchBackendKernel<<<rg,th>>>(enc,sharedData.payloadBits,sharedData.punctureBits,sharedData.repeatBits,bel,msg,int(batch));dim3 ldg(kNumCodewords,(unsigned)batch);layeredNMSBatchBackendKernel<<<ldg,Z>>>(bel,msg,int(batch),kProductionLDPCIterations);dim3 hdg(kNumCodewords,(K+th-1)/th,(unsigned)batch);hardDecisionBatchBackendKernel<<<hdg,th>>>(bel,sharedData.payloadBits,dec,int(batch));deriveScramblerBatchBackendKernel<<<int(batch),1>>>(dec,seq,den,int(batch));dim3 vg((kPayloadBits+th-1)/th,(unsigned)batch);validateBatchBackendKernel<<<vg,th>>>(dec,seq,den,dref,cs,be,int(batch));CUDA_CHECK(cudaGetLastError());CUDA_CHECK(cudaDeviceSynchronize());
-    // Validation outputs. In addition to decoded-bit statistics, copy the
-    // front-end synchronization state, the per-tone EHT-LTF channel estimate,
-    // and the equalized active tones to MATLAB. These bulk arrays are returned
-    // only by the validation command e2eBatch; the timed e2eBatchRun/Submit
-    // paths remain unchanged.
-    std::vector<unsigned long long> hcs(batch);
-    std::vector<unsigned int> hbe(batch);
-    std::vector<int> hoff(batch), hfin(batch);
-    std::vector<float> hcc(batch), hfc(batch), hnv(batch);
-    std::vector<cufftComplex> hch(size_t(batch)*kActiveToneCount);
-    std::vector<cufftComplex> heq(size_t(batch)*kActiveToneCount*kNumDataSymbols);
-    std::vector<float> hcsi(size_t(batch)*kDataToneCount);
-    std::vector<float> henc(size_t(batch)*kEncodedLength);
-
-    CUDA_CHECK(cudaMemcpy(hcs.data(),cs,batch*sizeof(unsigned long long),cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(hbe.data(),be,batch*sizeof(unsigned int),cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(hoff.data(),off,batch*sizeof(int),cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(hfin.data(),fin,batch*sizeof(int),cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(hcc.data(),cc,batch*sizeof(float),cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(hfc.data(),fc,batch*sizeof(float),cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(hnv.data(),nv,batch*sizeof(float),cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(hch.data(),ch,hch.size()*sizeof(cufftComplex),cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(heq.data(),eq,heq.size()*sizeof(cufftComplex),cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(hcsi.data(),csi,hcsi.size()*sizeof(float),cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(henc.data(),enc,henc.size()*sizeof(float),cudaMemcpyDeviceToHost));
-
-    const char* fs[]={
+    const char* fields[] = {
         "BatchSize","PacketsProcessed","TotalBitErrors","FailedPackets",
         "Checksums","BitErrorsPerPacket","PacketErrorsPerPacket",
         "CoarseOffsets","FinalOffsets","CoarseCFOHz","FineCFOHz",
         "NoiseVariance","ChannelEstimate","EqualizedActive",
-        "CSIWeights","EncodedLLR",
-        "ReturnedBulkOutputBytes","Pass"};
-    mxArray*out=mxCreateStructMatrix(1,1,18,fs);
+        "CSIWeights","EncodedLLR","ReturnedBulkOutputBytes","Pass"
+    };
+    mxArray* out = mxCreateStructMatrix(1,1,18,fields);
+    mxArray* checksums = mxCreateDoubleMatrix(batch,1,mxREAL);
+    mxArray* bitErrors = mxCreateDoubleMatrix(batch,1,mxREAL);
+    mxArray* packetErrors = mxCreateDoubleMatrix(batch,1,mxREAL);
+    mxArray* offsets = mxCreateDoubleMatrix(batch,1,mxREAL);
+    mxArray* finalOffsets = mxCreateDoubleMatrix(batch,1,mxREAL);
+    mxArray* coarseCFO = mxCreateDoubleMatrix(batch,1,mxREAL);
+    mxArray* fineCFO = mxCreateDoubleMatrix(batch,1,mxREAL);
+    mxArray* noise = mxCreateDoubleMatrix(batch,1,mxREAL);
 
-    mxArray*mc=mxCreateDoubleMatrix(batch,1,mxREAL);
-    mxArray*mb=mxCreateDoubleMatrix(batch,1,mxREAL);
-    mxArray*mp=mxCreateDoubleMatrix(batch,1,mxREAL);
-    mxArray*moff=mxCreateDoubleMatrix(batch,1,mxREAL);
-    mxArray*mfin=mxCreateDoubleMatrix(batch,1,mxREAL);
-    mxArray*mcc=mxCreateDoubleMatrix(batch,1,mxREAL);
-    mxArray*mfc=mxCreateDoubleMatrix(batch,1,mxREAL);
-    mxArray*mnv=mxCreateDoubleMatrix(batch,1,mxREAL);
-
-    double*pc=mxGetPr(mc);
-    double*pb=mxGetPr(mb);
-    double*pp=mxGetPr(mp);
-    double*po=mxGetPr(moff);
-    double*pf=mxGetPr(mfin);
-    double*pcc=mxGetPr(mcc);
-    double*pfc=mxGetPr(mfc);
-    double*pnv=mxGetPr(mnv);
-
-    double tbe=0,fail=0;
-    for(mwSize b=0;b<batch;++b){
-        pc[b]=double(hcs[b]);
-        pb[b]=double(hbe[b]);
-        pp[b]=hbe[b]?1.0:0.0;
-        po[b]=double(hoff[b]);
-        pf[b]=double(hfin[b]);
-        pcc[b]=double(hcc[b]);
-        pfc[b]=double(hfc[b]);
-        pnv[b]=double(hnv[b]);
-        tbe+=hbe[b];
-        fail+=pp[b];
+    double totalBitErrors = 0.0;
+    double failedPackets = 0.0;
+    for (mwSize b = 0; b < batch; ++b) {
+        mxGetPr(checksums)[b] = double(hostChecksums[b]);
+        mxGetPr(bitErrors)[b] = double(hostBitErrors[b]);
+        mxGetPr(packetErrors)[b] = hostBitErrors[b] ? 1.0 : 0.0;
+        mxGetPr(offsets)[b] = double(hostOffsets[b]);
+        mxGetPr(finalOffsets)[b] = double(hostFinalOffsets[b]);
+        mxGetPr(coarseCFO)[b] = double(hostCoarseCFO[b]);
+        mxGetPr(fineCFO)[b] = double(hostFineCFO[b]);
+        mxGetPr(noise)[b] = double(hostNoise[b]);
+        totalBitErrors += hostBitErrors[b];
+        failedPackets += hostBitErrors[b] ? 1.0 : 0.0;
     }
 
-    // GPU memory is laid out tone-fastest, then OFDM symbol, then packet.
-    // MATLAB column-major arrays with dimensions [tone x symbol x packet]
-    // therefore have exactly the same linear order.
-    mwSize chDims[2]={mwSize(kActiveToneCount),batch};
-    mxArray*mch=mxCreateNumericArray(2,chDims,mxSINGLE_CLASS,mxCOMPLEX);
-    mxComplexSingle*pch=mxGetComplexSingles(mch);
-    for(size_t i=0;i<hch.size();++i){
-        pch[i].real=hch[i].x;
-        pch[i].imag=hch[i].y;
+    mwSize channelDimensions[2] = {
+        mwSize(kActiveToneCount),batch
+    };
+    mxArray* channel = mxCreateNumericArray(
+        2,channelDimensions,mxSINGLE_CLASS,mxCOMPLEX);
+    mxComplexSingle* channelData = mxGetComplexSingles(channel);
+    for (size_t i = 0; i < hostChannel.size(); ++i) {
+        channelData[i].real = hostChannel[i].x;
+        channelData[i].imag = hostChannel[i].y;
     }
 
-    mwSize eqDims[3]={mwSize(kActiveToneCount),mwSize(kNumDataSymbols),batch};
-    mxArray*meq=mxCreateNumericArray(3,eqDims,mxSINGLE_CLASS,mxCOMPLEX);
-    mxComplexSingle*peq=mxGetComplexSingles(meq);
-    for(size_t i=0;i<heq.size();++i){
-        peq[i].real=heq[i].x;
-        peq[i].imag=heq[i].y;
+    mwSize equalizedDimensions[3] = {
+        mwSize(kActiveToneCount),mwSize(kNumDataSymbols),batch
+    };
+    mxArray* equalized = mxCreateNumericArray(
+        3,equalizedDimensions,mxSINGLE_CLASS,mxCOMPLEX);
+    mxComplexSingle* equalizedData = mxGetComplexSingles(equalized);
+    for (size_t i = 0; i < hostEqualized.size(); ++i) {
+        equalizedData[i].real = hostEqualized[i].x;
+        equalizedData[i].imag = hostEqualized[i].y;
     }
+
+    mwSize csiDimensions[2] = {mwSize(kDataToneCount),batch};
+    mxArray* csi = mxCreateNumericArray(
+        2,csiDimensions,mxSINGLE_CLASS,mxREAL);
+    std::memcpy(
+        mxGetSingles(csi),hostCSI.data(),
+        hostCSI.size()*sizeof(float));
+
+    mwSize encodedDimensions[2] = {mwSize(kEncodedLength),batch};
+    mxArray* encoded = mxCreateNumericArray(
+        2,encodedDimensions,mxSINGLE_CLASS,mxREAL);
+    std::memcpy(
+        mxGetSingles(encoded),hostEncoded.data(),
+        hostEncoded.size()*sizeof(float));
 
     mxSetField(out,0,"BatchSize",mxCreateDoubleScalar(double(batch)));
     mxSetField(out,0,"PacketsProcessed",mxCreateDoubleScalar(double(batch)));
-    mxSetField(out,0,"TotalBitErrors",mxCreateDoubleScalar(tbe));
-    mxSetField(out,0,"FailedPackets",mxCreateDoubleScalar(fail));
-    mxSetField(out,0,"Checksums",mc);
-    mxSetField(out,0,"BitErrorsPerPacket",mb);
-    mxSetField(out,0,"PacketErrorsPerPacket",mp);
-    mxSetField(out,0,"CoarseOffsets",moff);
-    mxSetField(out,0,"FinalOffsets",mfin);
-    mxSetField(out,0,"CoarseCFOHz",mcc);
-    mxSetField(out,0,"FineCFOHz",mfc);
-    mxSetField(out,0,"NoiseVariance",mnv);
-    mxSetField(out,0,"ChannelEstimate",mch);
-    mxSetField(out,0,"EqualizedActive",meq);
-
-    // CSIWeights: [3920 data tones x packet].
-    mwSize csiDims[2]={mwSize(kDataToneCount),batch};
-    mxArray*mcsi=mxCreateNumericArray(2,csiDims,mxSINGLE_CLASS,mxREAL);
-    std::memcpy(mxGetSingles(mcsi),hcsi.data(),hcsi.size()*sizeof(float));
-    mxSetField(out,0,"CSIWeights",mcsi);
-
-    // EncodedLLR: post-demapper, post-CSI-weighting, post-source-mapping
-    // soft values immediately before LDPC reconstruction.
-    mwSize encDims[2]={mwSize(kEncodedLength),batch};
-    mxArray*menc=mxCreateNumericArray(2,encDims,mxSINGLE_CLASS,mxREAL);
-    std::memcpy(mxGetSingles(menc),henc.data(),henc.size()*sizeof(float));
-    mxSetField(out,0,"EncodedLLR",menc);
-
-    mxSetField(out,0,"ReturnedBulkOutputBytes",
+    mxSetField(out,0,"TotalBitErrors",mxCreateDoubleScalar(totalBitErrors));
+    mxSetField(out,0,"FailedPackets",mxCreateDoubleScalar(failedPackets));
+    mxSetField(out,0,"Checksums",checksums);
+    mxSetField(out,0,"BitErrorsPerPacket",bitErrors);
+    mxSetField(out,0,"PacketErrorsPerPacket",packetErrors);
+    mxSetField(out,0,"CoarseOffsets",offsets);
+    mxSetField(out,0,"FinalOffsets",finalOffsets);
+    mxSetField(out,0,"CoarseCFOHz",coarseCFO);
+    mxSetField(out,0,"FineCFOHz",fineCFO);
+    mxSetField(out,0,"NoiseVariance",noise);
+    mxSetField(out,0,"ChannelEstimate",channel);
+    mxSetField(out,0,"EqualizedActive",equalized);
+    mxSetField(out,0,"CSIWeights",csi);
+    mxSetField(out,0,"EncodedLLR",encoded);
+    mxSetField(
+        out,0,"ReturnedBulkOutputBytes",
         mxCreateDoubleScalar(double(
-            (hch.size()+heq.size())*sizeof(cufftComplex) +
-            (hcsi.size()+henc.size())*sizeof(float))));
-    mxSetField(out,0,"Pass",mxCreateLogicalScalar(tbe==0&&fail==0));
-    if(lp)cufftDestroy(lp);if(dp)cufftDestroy(dp);cudaFree(be);cudaFree(cs);cudaFree(dref);cudaFree(den);cudaFree(seq);cudaFree(dec);cudaFree(msg);cudaFree(bel);cudaFree(enc);cudaFree(ellr);cudaFree(invq);cudaFree(csi);cudaFree(qq);cudaFree(qi);cudaFree(eq);cudaFree(rot);cudaFree(ch);cudaFree(da);cudaFree(la);cudaFree(doo);cudaFree(di);cudaFree(lo);cudaFree(li);cudaFree(df);cudaFree(lf);cudaFree(nv);cudaFree(fc);cudaFree(fin);cudaFree(corr);cudaFree(met);cudaFree(cc);cudaFree(off);cudaFree(is);cudaFree(tr);cudaFree(w);cudaFree(rq);cudaFree(ri);if(nlhs==1)plhs[0]=out;else mxDestroyArray(out);
+            (hostChannel.size()+hostEqualized.size())*
+                sizeof(cufftComplex) +
+            (hostCSI.size()+hostEncoded.size())*sizeof(float))));
+    mxSetField(
+        out,0,"Pass",
+        mxCreateLogicalScalar(
+            totalBitErrors == 0.0 && failedPackets == 0.0));
+
+    slot->occupied = false;
+    slot->ticket = 0;
+    slot->activeBatchSize = 0;
+
+    if (nlhs == 1)
+        plhs[0] = out;
+    else
+        mxDestroyArray(out);
 }
 
 
@@ -3999,38 +3711,9 @@ int batchedSlotIndex(const BatchedSlot* slot)
     return int(slot - &batchedSlots[0]);
 }
 
-// Allocate all four complete E2E batch buffers before the timed benchmark.
-// sampleCount and batchCapacity are supplied by MATLAB; only the number of
-// buffers (kNumSlots = 4) is fixed.
-
-void e2eBatchPrepareCommand(
-    int nlhs,mxArray* plhs[],int nrhs,const mxArray* prhs[])
+void prepareBatchedSlots(mwSize sampleCount,mwSize batchCapacity)
 {
-    if (nrhs != 3)
-        mexErrMsgIdAndTxt(
-            "eht_receiver_cuda_e2e:InputCount",
-            "e2eBatchPrepare expects sampleCount and batchCapacity.");
-
-    if (nlhs > 1)
-        mexErrMsgIdAndTxt(
-            "eht_receiver_cuda_e2e:OutputCount",
-            "e2eBatchPrepare returns at most one information structure.");
-
     ensureInitialized();
-
-    const double sampleCountRaw = scalar(prhs[1],"sampleCount");
-    const double batchCapacityRaw = scalar(prhs[2],"batchCapacity");
-
-    if (sampleCountRaw < 1.0 ||
-        batchCapacityRaw < 1.0 ||
-        floor(sampleCountRaw) != sampleCountRaw ||
-        floor(batchCapacityRaw) != batchCapacityRaw)
-        mexErrMsgIdAndTxt(
-            "eht_receiver_cuda_e2e:Input",
-            "sampleCount and batchCapacity must be positive integers.");
-
-    const mwSize sampleCount = mwSize(sampleCountRaw);
-    const mwSize batchCapacity = mwSize(batchCapacityRaw);
 
     for (int i = 0; i < kNumSlots; ++i) {
         BatchedSlot& s = batchedSlots[i];
@@ -4048,6 +3731,40 @@ void e2eBatchPrepareCommand(
 
         ensureBatchedFFTPlans(s,batchCapacity);
     }
+}
+
+// Allocate all four complete E2E batch buffers before the timed benchmark.
+// sampleCount and batchCapacity are supplied by MATLAB; only the number of
+// buffers (kNumSlots = 4) is fixed.
+
+void e2eBatchPrepareCommand(
+    int nlhs,mxArray* plhs[],int nrhs,const mxArray* prhs[])
+{
+    if (nrhs != 3)
+        mexErrMsgIdAndTxt(
+            "eht_receiver_cuda_e2e:InputCount",
+            "e2eBatchPrepare expects sampleCount and batchCapacity.");
+
+    if (nlhs > 1)
+        mexErrMsgIdAndTxt(
+            "eht_receiver_cuda_e2e:OutputCount",
+            "e2eBatchPrepare returns at most one information structure.");
+
+    const double sampleCountRaw = scalar(prhs[1],"sampleCount");
+    const double batchCapacityRaw = scalar(prhs[2],"batchCapacity");
+
+    if (sampleCountRaw < 1.0 ||
+        batchCapacityRaw < 1.0 ||
+        floor(sampleCountRaw) != sampleCountRaw ||
+        floor(batchCapacityRaw) != batchCapacityRaw)
+        mexErrMsgIdAndTxt(
+            "eht_receiver_cuda_e2e:Input",
+            "sampleCount and batchCapacity must be positive integers.");
+
+    const mwSize sampleCount = mwSize(sampleCountRaw);
+    const mwSize batchCapacity = mwSize(batchCapacityRaw);
+
+    prepareBatchedSlots(sampleCount,batchCapacity);
 
     if (nlhs == 1) {
         const char* fields[] = {
@@ -4086,51 +3803,12 @@ void e2eBatchSubmitCommand(
             "eht_receiver_cuda_e2e:OutputCount",
             "e2eBatchSubmit returns one ticket.");
 
-    if (!mxIsInt16(prhs[1]) || mxIsComplex(prhs[1]) ||
-        !mxIsInt16(prhs[2]) || mxIsComplex(prhs[2]))
-        mexErrMsgIdAndTxt(
-            "eht_receiver_cuda_e2e:Input",
-            "RxI/RxQ must be real int16 matrices.");
-
-    const mwSize count = mxGetM(prhs[1]);
-    const mwSize batch = mxGetN(prhs[1]);
-
-    if (count < kPacketLengthSamples ||
-        batch < 1 ||
-        mxGetM(prhs[2]) != count ||
-        mxGetN(prhs[2]) != batch)
-        mexErrMsgIdAndTxt(
-            "eht_receiver_cuda_e2e:Input",
-            "RxI/RxQ must be [samples x batch].");
-
-    const mwSize scn = mxGetNumberOfElements(prhs[3]);
-    if (scn != 1 && scn != batch)
-        mexErrMsgIdAndTxt(
-            "eht_receiver_cuda_e2e:Input",
-            "RxScale must be scalar or one value per packet.");
-
-    const double llrScale = scalar(prhs[4],"llrScale");
-    if (!(llrScale > 0.0))
-        mexErrMsgIdAndTxt(
-            "eht_receiver_cuda_e2e:Input",
-            "llrScale must be positive.");
-
-    if (!mxIsSingle(prhs[5]) ||
-        !mxIsComplex(prhs[5]) ||
-        mxGetNumberOfElements(prhs[5]) != 2560)
-        mexErrMsgIdAndTxt(
-            "eht_receiver_cuda_e2e:Input",
-            "L-LTF reference must be complex single, 2560 samples.");
-
-    const int ltfStart =
-        int(scalar(prhs[8],"ltfFFTStart")) - 1;
-    if (ltfStart < 0 ||
-        ltfStart + kFFTLength > kEHTLTFLength)
-        mexErrMsgIdAndTxt(
-            "eht_receiver_cuda_e2e:Input",
-            "Invalid ltfFFTStart.");
-
-    const int d0 = parseDataFFTStart0(prhs[9]);
+    const BatchedReceiverInput input = parseBatchedReceiverInput(prhs);
+    const mwSize count = input.sampleCount;
+    const mwSize batch = input.batchSize;
+    const double llrScale = input.llrScale;
+    const int ltfStart = input.ltfFFTStart;
+    const int d0 = input.dataFFTStart;
 
     ensureInitialized();
     initializeFrontendMetadata(
@@ -4164,33 +3842,10 @@ void e2eBatchSubmitCommand(
     std::memcpy(slot->hRxI,mxGetData(prhs[1]),iqBytes);
     std::memcpy(slot->hRxQ,mxGetData(prhs[2]),iqBytes);
 
-    for (mwSize b = 0; b < batch; ++b) {
-        double v;
-        if (mxIsDouble(prhs[3]))
-            v = mxGetDoubles(prhs[3])[scn == 1 ? 0 : b];
-        else if (mxIsSingle(prhs[3]))
-            v = double(mxGetSingles(prhs[3])[scn == 1 ? 0 : b]);
-        else
-            v = scalar(prhs[3],"RxScale");
-
-        if (!(v > 0.0))
-            mexErrMsgIdAndTxt(
-                "eht_receiver_cuda_e2e:Input",
-                "RxScale must be positive.");
-
-        slot->hInverseScales[b] = float(1.0/v);
-    }
-
-    const mxComplexSingle* hr = mxGetComplexSingles(prhs[5]);
-    double referenceEnergy = 0.0;
-    for (int i = 0; i < 2560; ++i) {
-        slot->hLLTFReference[i] =
-            cufftComplex{hr[i].real,hr[i].imag};
-        referenceEnergy +=
-            double(hr[i].real)*double(hr[i].real) +
-            double(hr[i].imag)*double(hr[i].imag);
-    }
-    const float refE = float(referenceEnergy);
+    copyInverseScales(
+        prhs[3],input.scaleCount,batch,slot->hInverseScales);
+    const float refE =
+        copyLLTFReference(prhs[5],slot->hLLTFReference);
 
     slot->ticket = nextBatchedTicket++;
     slot->occupied = true;
@@ -4665,362 +4320,46 @@ void e2eBatchResetCommand()
     }
 }
 
-void e2eBatchRunCommand(int nlhs,mxArray* plhs[],int nrhs,const mxArray* prhs[])
-{
-    if(nrhs!=14) mexErrMsgIdAndTxt("eht_receiver_cuda_e2e:InputCount","e2eBatchRun expects command plus 13 inputs.");
-    if(nlhs>1) mexErrMsgIdAndTxt("eht_receiver_cuda_e2e:OutputCount","e2eBatchRun returns one batch result structure.");
-    if(!mxIsInt16(prhs[1])||mxIsComplex(prhs[1])||!mxIsInt16(prhs[2])||mxIsComplex(prhs[2])) mexErrMsgIdAndTxt("eht_receiver_cuda_e2e:Input","RxI/RxQ must be real int16 matrices.");
-    mwSize count=mxGetM(prhs[1]),batch=mxGetN(prhs[1]);if(count<kPacketLengthSamples||batch<1||mxGetM(prhs[2])!=count||mxGetN(prhs[2])!=batch) mexErrMsgIdAndTxt("eht_receiver_cuda_e2e:Input","RxI/RxQ must be [samples x batch].");
-    mwSize scn=mxGetNumberOfElements(prhs[3]);if(scn!=1&&scn!=batch) mexErrMsgIdAndTxt("eht_receiver_cuda_e2e:Input","RxScale must be scalar or one value per packet.");
-    double llrScale=scalar(prhs[4],"llrScale");if(!(llrScale>0))mexErrMsgIdAndTxt("eht_receiver_cuda_e2e:Input","llrScale must be positive.");
-    if(!mxIsSingle(prhs[5])||!mxIsComplex(prhs[5])||mxGetNumberOfElements(prhs[5])!=2560) mexErrMsgIdAndTxt("eht_receiver_cuda_e2e:Input","L-LTF reference must be complex single, 2560 samples.");
-    int ltfStart=int(scalar(prhs[8],"ltfFFTStart"))-1;if(ltfStart<0||ltfStart+kFFTLength>kEHTLTFLength)mexErrMsgIdAndTxt("eht_receiver_cuda_e2e:Input","Invalid ltfFFTStart.");
-    int d0=parseDataFFTStart0(prhs[9]);
-    ensureInitialized();initializeFrontendMetadata(prhs[6],prhs[7],prhs[10],prhs[11],prhs[12],prhs[13]);
-    std::vector<float> inv(batch);for(mwSize b=0;b<batch;++b){double v=mxIsDouble(prhs[3])?mxGetDoubles(prhs[3])[scn==1?0:b]:mxIsSingle(prhs[3])?double(mxGetSingles(prhs[3])[scn==1?0:b]):scalar(prhs[3],"RxScale");if(!(v>0))mexErrMsgIdAndTxt("eht_receiver_cuda_e2e:Input","RxScale must be positive.");inv[b]=float(1.0/v);}
-    const mxComplexSingle* hr=mxGetComplexSingles(prhs[5]);std::vector<cufftComplex> tref(2560);double er=0;for(int i=0;i<2560;++i){tref[i]={hr[i].real,hr[i].imag};er+=double(hr[i].real)*hr[i].real+double(hr[i].imag)*hr[i].imag;}float refE=float(er);
-    size_t total=size_t(count)*batch;int16_t *ri=nullptr,*rq=nullptr,*qi=nullptr,*qq=nullptr;cufftComplex *w=nullptr,*tr=nullptr,*lf=nullptr,*df=nullptr,*li=nullptr,*lo=nullptr,*di=nullptr,*doo=nullptr,*la=nullptr,*da=nullptr,*ch=nullptr,*rot=nullptr,*eq=nullptr;float *is=nullptr,*cc=nullptr,*met=nullptr,*fc=nullptr,*nv=nullptr,*csi=nullptr,*invq=nullptr,*enc=nullptr,*bel=nullptr,*msg=nullptr;int *off=nullptr,*corr=nullptr,*fin=nullptr,*den=nullptr;float *ellr=nullptr;int8_t *dec=nullptr,*seq=nullptr,*descr=nullptr;unsigned long long*cs=nullptr;cufftHandle lp=0,dp=0;
-    auto cm=[&](void**p,size_t n){CUDA_CHECK(cudaMalloc(p,n));};cm((void**)&ri,total*sizeof(int16_t));cm((void**)&rq,total*sizeof(int16_t));cm((void**)&w,total*sizeof(cufftComplex));cm((void**)&tr,2560*sizeof(cufftComplex));cm((void**)&is,batch*sizeof(float));cm((void**)&off,batch*sizeof(int));cm((void**)&cc,batch*sizeof(float));cm((void**)&met,size_t(batch)*513*sizeof(float));cm((void**)&corr,batch*sizeof(int));cm((void**)&fin,batch*sizeof(int));cm((void**)&fc,batch*sizeof(float));cm((void**)&nv,batch*sizeof(float));cm((void**)&lf,size_t(batch)*kEHTLTFLength*sizeof(cufftComplex));cm((void**)&df,size_t(batch)*kEHTDataLength*sizeof(cufftComplex));cm((void**)&li,size_t(batch)*kFFTLength*sizeof(cufftComplex));cm((void**)&lo,size_t(batch)*kFFTLength*sizeof(cufftComplex));cm((void**)&di,size_t(batch)*kDataInputCount*sizeof(cufftComplex));cm((void**)&doo,size_t(batch)*kDataInputCount*sizeof(cufftComplex));cm((void**)&la,size_t(batch)*kActiveToneCount*sizeof(cufftComplex));cm((void**)&da,size_t(batch)*kActiveToneCount*kNumDataSymbols*sizeof(cufftComplex));cm((void**)&ch,size_t(batch)*kActiveToneCount*sizeof(cufftComplex));cm((void**)&rot,size_t(batch)*kNumDataSymbols*sizeof(cufftComplex));cm((void**)&eq,size_t(batch)*kActiveToneCount*kNumDataSymbols*sizeof(cufftComplex));cm((void**)&qi,size_t(batch)*kTotalSymbols*sizeof(int16_t));cm((void**)&qq,size_t(batch)*kTotalSymbols*sizeof(int16_t));cm((void**)&csi,size_t(batch)*kDataToneCount*sizeof(float));cm((void**)&invq,size_t(batch)*kNumSegments*sizeof(float));cm((void**)&ellr,size_t(batch)*kTotalSymbols*kBitsPerSymbol*sizeof(float));cm((void**)&enc,size_t(batch)*kEncodedLength*sizeof(float));cm((void**)&bel,size_t(batch)*kNumCodewords*N*sizeof(float));cm((void**)&msg,size_t(batch)*kNumCodewords*EDGES*sizeof(float));cm((void**)&dec,size_t(batch)*kTotalDecodedBits*sizeof(int8_t));cm((void**)&seq,size_t(batch)*2047*sizeof(int8_t));cm((void**)&descr,size_t(batch)*kTotalDecodedBits*sizeof(int8_t));cm((void**)&den,batch*sizeof(int));cm((void**)&cs,batch*sizeof(unsigned long long));
-    CUDA_CHECK(cudaMemcpy(ri,mxGetData(prhs[1]),total*sizeof(int16_t),cudaMemcpyHostToDevice));CUDA_CHECK(cudaMemcpy(rq,mxGetData(prhs[2]),total*sizeof(int16_t),cudaMemcpyHostToDevice));CUDA_CHECK(cudaMemcpy(tr,tref.data(),2560*sizeof(cufftComplex),cudaMemcpyHostToDevice));CUDA_CHECK(cudaMemcpy(is,inv.data(),batch*sizeof(float),cudaMemcpyHostToDevice));std::vector<int> init(batch,int(count));CUDA_CHECK(cudaMemcpy(off,init.data(),batch*sizeof(int),cudaMemcpyHostToDevice));CUDA_CHECK(cudaMemset(cs,0,batch*sizeof(unsigned long long)));
-    
-    
-    
-    // STEP 7: fine-grained GPU front-end profiling for the e2eBatchRun path.
-    // The benchmark uses e2eBatchRun, so the CUDA events must be declared and
-    
-    // recorded in this function's scope (not only in e2eBatchCommand).
-    
-    cudaEvent_t evPacketDetectStart=nullptr, evPacketDetectEnd=nullptr;
-    cudaEvent_t evCoarseCFOEnd=nullptr, evTimingSyncEnd=nullptr, evFineCFOEnd=nullptr;
-    cudaEvent_t evOFDMStart=nullptr, evOFDMEnd=nullptr;
-    cudaEvent_t evChannelEstimationEnd=nullptr, evEqualizationEnd=nullptr;
-    cudaEvent_t evQAMDemappingEnd=nullptr, evLLRGenerationEnd=nullptr;
-    cudaEvent_t evLDPCDecodingEnd=nullptr, evDescramblingEnd=nullptr, evPayloadRecoveryEnd=nullptr;
-    CUDA_CHECK(cudaEventCreate(&evPacketDetectStart));
-    CUDA_CHECK(cudaEventCreate(&evPacketDetectEnd));
-    CUDA_CHECK(cudaEventCreate(&evCoarseCFOEnd));
-    CUDA_CHECK(cudaEventCreate(&evTimingSyncEnd));
-    CUDA_CHECK(cudaEventCreate(&evFineCFOEnd));
-    CUDA_CHECK(cudaEventCreate(&evOFDMStart));
-    CUDA_CHECK(cudaEventCreate(&evOFDMEnd));
-    CUDA_CHECK(cudaEventCreate(&evChannelEstimationEnd));
-    CUDA_CHECK(cudaEventCreate(&evEqualizationEnd));
-    CUDA_CHECK(cudaEventCreate(&evQAMDemappingEnd));
-    CUDA_CHECK(cudaEventCreate(&evLLRGenerationEnd));
-    CUDA_CHECK(cudaEventCreate(&evLDPCDecodingEnd));
-    CUDA_CHECK(cudaEventCreate(&evDescramblingEnd));
-    CUDA_CHECK(cudaEventCreate(&evPayloadRecoveryEnd));
-
-    int th=256;
-    dim3 sg((int(count)+th-1)/th,(unsigned)batch);
-
-    // INT16 -> FP32 waveform reconstruction is intentionally outside the
-    // locked 12 receiver-stage timings.
-    reconstructWaveformBatchKernel<<<sg,th>>>(ri,rq,w,is,int(count),int(batch));
-    CUDA_CHECK(cudaGetLastError());
-
-    // Stage 1: Packet Detection.
-    CUDA_CHECK(cudaEventRecord(evPacketDetectStart));
-    dim3 dg((int(count)-512+1+th-1)/th,(unsigned)batch);
-    packetDetectBatchKernel<<<dg,th>>>(w,int(count),off,int(batch));
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaEventRecord(evPacketDetectEnd));
-
-    // Stage 2: Coarse CFO = estimation + correction.
-    coarseCFOBatchKernel<<<int(batch),th>>>(w,off,int(count),cc,int(batch));
-    CUDA_CHECK(cudaGetLastError());
-    cfoCorrectBatchKernel<<<sg,th>>>(w,off,int(count),cc,int(batch));
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaEventRecord(evCoarseCFOEnd));
-
-    // Stage 3: Timing Synchronization.
-    dim3 tg((513+th-1)/th,(unsigned)batch);
-    timingMetricBatchKernel<<<tg,th>>>(w,tr,off,int(count),refE,met,int(batch));
-    CUDA_CHECK(cudaGetLastError());
-    timingArgMaxBatchKernel<<<int(batch),1>>>(met,off,corr,fin,int(batch));
-    CUDA_CHECK(cudaGetLastError());
-    rebaseBatchKernel<<<sg,th>>>(w,fin,corr,int(count),cc,int(batch));
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaEventRecord(evTimingSyncEnd));
-
-    // Stage 4: Fine CFO = estimation + correction.
-    fineCFOBatchKernel<<<int(batch),th>>>(w,fin,int(count),fc,int(batch));
-    CUDA_CHECK(cudaGetLastError());
-    cfoCorrectBatchKernel<<<sg,th>>>(w,fin,int(count),fc,int(batch));
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaEventRecord(evFineCFOEnd));
-
-    // Noise estimation is outside the locked 12 stage timings.
-    noiseBatchKernel<<<int(batch),th>>>(w,fin,int(count),nv,int(batch));
-    CUDA_CHECK(cudaGetLastError());
-
-    // Stage 5: OFDM Demodulation = EHT field extraction + FFT window gather
-    // + cuFFT execution + active-tone extraction.
-    CUDA_CHECK(cudaEventRecord(evOFDMStart));
-    dim3 eg((kEHTDataLength+th-1)/th,(unsigned)batch);
-    extractFieldsBatchKernel<<<eg,th>>>(w,fin,int(count),lf,df,int(batch));
-    CUDA_CHECK(cudaGetLastError());
-    dim3 gg((kFFTLength+th-1)/th,(unsigned)batch);
-    gatherFFTWindowsBatchKernel<<<gg,th>>>(lf,df,li,di,ltfStart,d0,int(batch));
-    CUDA_CHECK(cudaGetLastError());
-    int n[1]={kFFTLength},emb[1]={kFFTLength};
-    CUFFT_CHECK(cufftPlanMany(&lp,1,n,emb,1,kFFTLength,emb,1,kFFTLength,CUFFT_C2C,int(batch)));
-    CUFFT_CHECK(cufftPlanMany(&dp,1,n,emb,1,kFFTLength,emb,1,kFFTLength,CUFFT_C2C,int(batch)*kNumDataSymbols));
-    CUFFT_CHECK(cufftExecC2C(lp,li,lo,CUFFT_FORWARD));
-    CUFFT_CHECK(cufftExecC2C(dp,di,doo,CUFFT_FORWARD));
-    dim3 ag((kActiveToneCount+th-1)/th,(unsigned)batch);
-    extractActiveBatchBackendKernel<<<ag,th>>>(lo,doo,sharedData.ltfFFTIndices,sharedData.dataFFTIndices,la,da,int(batch));
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaEventRecord(evOFDMEnd));
-
-    // Stage 6: Channel Estimation.
-    estimateChannelBatchBackendKernel<<<ag,th>>>(la,sharedData.knownLTF,ch,int(batch));
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaEventRecord(evChannelEstimationEnd));
-
-    // Stage 7: Equalization = pilot phase tracking + equalization.
-    pilotRotationBatchBackendKernel<<<int(batch)*kNumDataSymbols,256,256*sizeof(cufftComplex)>>>(da,ch,sharedData.pilotIndices,sharedData.pilotReference,sharedData.pilotCount,rot,int(batch));
-    CUDA_CHECK(cudaGetLastError());
-    dim3 eqg((kActiveToneCount*kNumDataSymbols+th-1)/th,(unsigned)batch);
-    equalizeBatchBackendKernel<<<eqg,th>>>(da,ch,rot,nv,eq,int(batch));
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaEventRecord(evEqualizationEnd));
-
-    // Stage 8: 4096-QAM Demapping directly from FP32 equalized symbols.
-    int bt=int(batch)*kTotalSymbols;
-    qamFP32BatchBackendKernel<<<(bt+th-1)/th,th>>>(
-        eq,ch,sharedData.dataIndices,ellr,csi,nv,int(batch));
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaEventRecord(evQAMDemappingEnd));
-
-    // Stage 9: LLR Generation = LLR rescaling/CSI weighting and mapping to
-    // the encoded LDPC input ordering.
-    int beN=int(batch)*kEncodedLength;
-    mapWeightBatchBackendKernel<<<(beN+th-1)/th,th>>>(ellr,csi,sharedData.encodedSourceIndex,float(1.0/llrScale),enc,int(batch));
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaEventRecord(evLLRGenerationEnd));
-
-    // Stage 10: LDPC Decoding = codeword reconstruction, layered normalized
-    // min-sum iterations, and hard decision.
-    dim3 rg(kNumCodewords,(N+th-1)/th,(unsigned)batch);
-    reconstructBatchBackendKernel<<<rg,th>>>(enc,sharedData.payloadBits,sharedData.punctureBits,sharedData.repeatBits,bel,msg,int(batch));
-    CUDA_CHECK(cudaGetLastError());
-    dim3 ldg(kNumCodewords,(unsigned)batch);
-    layeredNMSBatchBackendKernel<<<ldg,Z>>>(bel,msg,int(batch),kProductionLDPCIterations);
-    CUDA_CHECK(cudaGetLastError());
-    dim3 hdg(kNumCodewords,(K+th-1)/th,(unsigned)batch);
-    hardDecisionBatchBackendKernel<<<hdg,th>>>(bel,sharedData.payloadBits,dec,int(batch));
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaEventRecord(evLDPCDecodingEnd));
-
-    // Stage 11: Descrambling = derive the scrambler sequence and apply it to
-    // the complete decoded bitstream.
-    deriveScramblerBatchBackendKernel<<<int(batch),1>>>(dec,seq,den,int(batch));
-    CUDA_CHECK(cudaGetLastError());
-    int descrN=int(batch)*kTotalDecodedBits;
-    descrambleDecodedBatchBackendKernel<<<(descrN+th-1)/th,th>>>(dec,seq,den,descr,int(batch));
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaEventRecord(evDescramblingEnd));
-
-    // Stage 12: Payload Recovery = extract the payload region and calculate
-    // the existing scalar checksum used by the benchmark.
-    dim3 vg((kPayloadBits+th-1)/th,(unsigned)batch);
-    checksumRecoveredPayloadBatchBackendKernel<<<vg,th>>>(descr,cs,int(batch));
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaEventRecord(evPayloadRecoveryEnd));
-    CUDA_CHECK(cudaDeviceSynchronize());
-    // STEP 7: read the four front-end stage timings after device completion.
-    float packetDetectionMs=0.0f, coarseCFOMs=0.0f, timingSyncMs=0.0f, fineCFOMs=0.0f;
-    float ofdmMs=0.0f, channelEstimationMs=0.0f, equalizationMs=0.0f;
-    float qamDemappingMs=0.0f, llrGenerationMs=0.0f, ldpcDecodingMs=0.0f;
-    float descramblingMs=0.0f, payloadRecoveryMs=0.0f;
-    CUDA_CHECK(cudaEventElapsedTime(&packetDetectionMs,evPacketDetectStart,evPacketDetectEnd));
-    CUDA_CHECK(cudaEventElapsedTime(&coarseCFOMs,evPacketDetectEnd,evCoarseCFOEnd));
-    CUDA_CHECK(cudaEventElapsedTime(&timingSyncMs,evCoarseCFOEnd,evTimingSyncEnd));
-    CUDA_CHECK(cudaEventElapsedTime(&fineCFOMs,evTimingSyncEnd,evFineCFOEnd));
-    CUDA_CHECK(cudaEventElapsedTime(&ofdmMs,evOFDMStart,evOFDMEnd));
-    CUDA_CHECK(cudaEventElapsedTime(&channelEstimationMs,evOFDMEnd,evChannelEstimationEnd));
-    CUDA_CHECK(cudaEventElapsedTime(&equalizationMs,evChannelEstimationEnd,evEqualizationEnd));
-    CUDA_CHECK(cudaEventElapsedTime(&qamDemappingMs,evEqualizationEnd,evQAMDemappingEnd));
-    CUDA_CHECK(cudaEventElapsedTime(&llrGenerationMs,evQAMDemappingEnd,evLLRGenerationEnd));
-    CUDA_CHECK(cudaEventElapsedTime(&ldpcDecodingMs,evLLRGenerationEnd,evLDPCDecodingEnd));
-    CUDA_CHECK(cudaEventElapsedTime(&descramblingMs,evLDPCDecodingEnd,evDescramblingEnd));
-    CUDA_CHECK(cudaEventElapsedTime(&payloadRecoveryMs,evDescramblingEnd,evPayloadRecoveryEnd));
-
-    std::vector<unsigned long long> hcs(batch);CUDA_CHECK(cudaMemcpy(hcs.data(),cs,batch*sizeof(unsigned long long),cudaMemcpyDeviceToHost));
-    const char* fs[]={"BatchSize","PacketsProcessed","Checksums","ReturnedBulkOutputBytes","Pass","PacketDetectionTimeMs","CoarseCFOTimeMs","TimingSynchronizationTimeMs","FineCFOTimeMs","OFDMDemodulationTimeMs","ChannelEstimationTimeMs","EqualizationTimeMs","QAMDemappingTimeMs","LLRGenerationTimeMs","LDPCDecodingTimeMs","DescramblingTimeMs","PayloadRecoveryTimeMs"};
-    mxArray*out=mxCreateStructMatrix(1,1,17,fs);mxArray*mc=mxCreateDoubleMatrix(batch,1,mxREAL);double*pc=mxGetPr(mc);for(mwSize b=0;b<batch;++b)pc[b]=double(hcs[b]);mxSetField(out,0,"BatchSize",mxCreateDoubleScalar(double(batch)));mxSetField(out,0,"PacketsProcessed",mxCreateDoubleScalar(double(batch)));mxSetField(out,0,"Checksums",mc);mxSetField(out,0,"ReturnedBulkOutputBytes",mxCreateDoubleScalar(0));mxSetField(out,0,"Pass",mxCreateLogicalScalar(true));
-    mxSetField(out,0,"PacketDetectionTimeMs",mxCreateDoubleScalar(double(packetDetectionMs)));
-    mxSetField(out,0,"CoarseCFOTimeMs",mxCreateDoubleScalar(double(coarseCFOMs)));
-    mxSetField(out,0,"TimingSynchronizationTimeMs",mxCreateDoubleScalar(double(timingSyncMs)));
-    mxSetField(out,0,"FineCFOTimeMs",mxCreateDoubleScalar(double(fineCFOMs)));
-    mxSetField(out,0,"OFDMDemodulationTimeMs",mxCreateDoubleScalar(double(ofdmMs)));
-    mxSetField(out,0,"ChannelEstimationTimeMs",mxCreateDoubleScalar(double(channelEstimationMs)));
-    mxSetField(out,0,"EqualizationTimeMs",mxCreateDoubleScalar(double(equalizationMs)));
-    mxSetField(out,0,"QAMDemappingTimeMs",mxCreateDoubleScalar(double(qamDemappingMs)));
-    mxSetField(out,0,"LLRGenerationTimeMs",mxCreateDoubleScalar(double(llrGenerationMs)));
-    mxSetField(out,0,"LDPCDecodingTimeMs",mxCreateDoubleScalar(double(ldpcDecodingMs)));
-    mxSetField(out,0,"DescramblingTimeMs",mxCreateDoubleScalar(double(descramblingMs)));
-    mxSetField(out,0,"PayloadRecoveryTimeMs",mxCreateDoubleScalar(double(payloadRecoveryMs)));
-
-    CUDA_CHECK(cudaEventDestroy(evPayloadRecoveryEnd));
-    CUDA_CHECK(cudaEventDestroy(evDescramblingEnd));
-    CUDA_CHECK(cudaEventDestroy(evLDPCDecodingEnd));
-    CUDA_CHECK(cudaEventDestroy(evLLRGenerationEnd));
-    CUDA_CHECK(cudaEventDestroy(evQAMDemappingEnd));
-    CUDA_CHECK(cudaEventDestroy(evEqualizationEnd));
-    CUDA_CHECK(cudaEventDestroy(evChannelEstimationEnd));
-    CUDA_CHECK(cudaEventDestroy(evOFDMEnd));
-    CUDA_CHECK(cudaEventDestroy(evOFDMStart));
-    CUDA_CHECK(cudaEventDestroy(evFineCFOEnd));CUDA_CHECK(cudaEventDestroy(evTimingSyncEnd));CUDA_CHECK(cudaEventDestroy(evCoarseCFOEnd));CUDA_CHECK(cudaEventDestroy(evPacketDetectEnd));CUDA_CHECK(cudaEventDestroy(evPacketDetectStart));
-    if(lp)cufftDestroy(lp);if(dp)cufftDestroy(dp);cudaFree(cs);cudaFree(den);cudaFree(descr);cudaFree(seq);cudaFree(dec);cudaFree(msg);cudaFree(bel);cudaFree(enc);cudaFree(ellr);cudaFree(invq);cudaFree(csi);cudaFree(qq);cudaFree(qi);cudaFree(eq);cudaFree(rot);cudaFree(ch);cudaFree(da);cudaFree(la);cudaFree(doo);cudaFree(di);cudaFree(lo);cudaFree(li);cudaFree(df);cudaFree(lf);cudaFree(nv);cudaFree(fc);cudaFree(fin);cudaFree(corr);cudaFree(met);cudaFree(cc);cudaFree(off);cudaFree(is);cudaFree(tr);cudaFree(w);cudaFree(rq);cudaFree(ri);if(nlhs==1)plhs[0]=out;else mxDestroyArray(out);
-}
-
-void e2eBatchLegacyCommand(
+void e2eBatchRunCommand(
     int nlhs,mxArray* plhs[],int nrhs,const mxArray* prhs[])
 {
-    // Legacy correctness implementation retained for reference.
-    // command + 14 inputs, matching e2e, except RxI/RxQ are
-    // [samplesPerPacket x batchSize] and RxScale may be scalar or batchSize.
-    if (nrhs != 15)
+    if (nrhs != 14)
         mexErrMsgIdAndTxt(
             "eht_receiver_cuda_e2e:InputCount",
-            "e2eBatch expects command plus 14 inputs.");
+            "e2eBatchRun expects command plus 13 inputs.");
+
     if (nlhs > 1)
         mexErrMsgIdAndTxt(
             "eht_receiver_cuda_e2e:OutputCount",
-            "e2eBatch returns one batch validation structure.");
+            "e2eBatchRun returns one batch result structure.");
 
-    if (!mxIsInt16(prhs[1]) || mxIsComplex(prhs[1]) ||
-        !mxIsInt16(prhs[2]) || mxIsComplex(prhs[2]))
+    if (!mxIsInt16(prhs[1]) || mxIsComplex(prhs[1]))
         mexErrMsgIdAndTxt(
             "eht_receiver_cuda_e2e:Input",
-            "RxI and RxQ must be real int16 matrices.");
+            "RxI must be a real int16 matrix.");
 
-    const mwSize samplesPerPacket = mxGetM(prhs[1]);
-    const mwSize batchSize = mxGetN(prhs[1]);
-    if (samplesPerPacket < kPacketLengthSamples || batchSize < 1 ||
-        mxGetM(prhs[2]) != samplesPerPacket ||
-        mxGetN(prhs[2]) != batchSize)
-        mexErrMsgIdAndTxt(
-            "eht_receiver_cuda_e2e:Input",
-            "RxI and RxQ must be [samplesPerPacket x batchSize] with at least %d samples per packet.", kPacketLengthSamples);
+    // The asynchronous batch path is the canonical implementation of the
+    // complete receiver. Prepare it on demand, submit one batch, and collect
+    // it immediately to retain e2eBatchRun's synchronous behavior.
+    prepareBatchedSlots(mxGetM(prhs[1]),mxGetN(prhs[1]));
 
-    const mwSize scaleCount = mxGetNumberOfElements(prhs[3]);
-    if (scaleCount != 1 && scaleCount != batchSize)
-        mexErrMsgIdAndTxt(
-            "eht_receiver_cuda_e2e:Input",
-            "RxScale must be scalar or contain one value per packet in the batch.");
+    mxArray* submitOutputs[] = {nullptr};
+    e2eBatchSubmitCommand(1,submitOutputs,nrhs,prhs);
+    mxArray* ticket = submitOutputs[0];
 
-    // Reference bits may be one common [kPayloadBits x 1] vector or
-    // [kPayloadBits x batchSize] for packet-specific validation.
-    if (mxIsComplex(prhs[14]) ||
-        !(mxIsInt8(prhs[14]) || mxIsLogical(prhs[14])))
-        mexErrMsgIdAndTxt(
-            "eht_receiver_cuda_e2e:Input",
-            "referencePayloadBits must be int8/logical.");
-    const mwSize refRows = mxGetM(prhs[14]);
-    const mwSize refCols = mxGetN(prhs[14]);
-    if (refRows != kPayloadBits || (refCols != 1 && refCols != batchSize))
-        mexErrMsgIdAndTxt(
-            "eht_receiver_cuda_e2e:Input",
-            "referencePayloadBits must be [%d x 1] or [%d x batchSize].",kPayloadBits,kPayloadBits);
+    const mxArray* collectInputs[] = {prhs[0],ticket};
+    e2eBatchCollectCommand(nlhs,plhs,2,collectInputs);
+    mxDestroyArray(ticket);
 
-    const char* fields[] = {
-        "BatchSize","PacketsProcessed","TotalBitErrors","FailedPackets",
-        "Checksums","BitErrorsPerPacket","PacketErrorsPerPacket",
-        "ReturnedBulkOutputBytes","Pass"
-    };
-    mxArray* out = mxCreateStructMatrix(1,1,9,fields);
-    mxArray* checksums = mxCreateDoubleMatrix(batchSize,1,mxREAL);
-    mxArray* bitErrors = mxCreateDoubleMatrix(batchSize,1,mxREAL);
-    mxArray* packetErrors = mxCreateDoubleMatrix(batchSize,1,mxREAL);
-    double* checksumData = mxGetPr(checksums);
-    double* bitErrorData = mxGetPr(bitErrors);
-    double* packetErrorData = mxGetPr(packetErrors);
-
-    const int16_t* allI = static_cast<const int16_t*>(mxGetData(prhs[1]));
-    const int16_t* allQ = static_cast<const int16_t*>(mxGetData(prhs[2]));
-
-    double totalBitErrors = 0.0;
-    double failedPackets = 0.0;
-    double returnedBytes = 0.0;
-
-    for (mwSize b = 0; b < batchSize; ++b) {
-        mxArray* rxI = mxCreateNumericMatrix(samplesPerPacket,1,mxINT16_CLASS,mxREAL);
-        mxArray* rxQ = mxCreateNumericMatrix(samplesPerPacket,1,mxINT16_CLASS,mxREAL);
-        std::memcpy(mxGetData(rxI),allI + b*samplesPerPacket,
-                    size_t(samplesPerPacket)*sizeof(int16_t));
-        std::memcpy(mxGetData(rxQ),allQ + b*samplesPerPacket,
-                    size_t(samplesPerPacket)*sizeof(int16_t));
-
-        double scaleValue = 0.0;
-        if (mxIsDouble(prhs[3])) {
-            const double* p = mxGetDoubles(prhs[3]);
-            scaleValue = p[scaleCount == 1 ? 0 : b];
-        } else if (mxIsSingle(prhs[3])) {
-            const float* p = mxGetSingles(prhs[3]);
-            scaleValue = double(p[scaleCount == 1 ? 0 : b]);
-        } else {
-            scaleValue = scalar(prhs[3],"RxScale");
-        }
-        mxArray* scale = mxCreateDoubleScalar(scaleValue);
-
-        mxArray* refBits = nullptr;
-        if (mxIsInt8(prhs[14])) {
-            refBits = mxCreateNumericMatrix(kPayloadBits,1,mxINT8_CLASS,mxREAL);
-            const int8_t* src = static_cast<const int8_t*>(mxGetData(prhs[14]));
-            const mwSize col = refCols == 1 ? 0 : b;
-            std::memcpy(mxGetData(refBits),src + col*kPayloadBits,
-                        size_t(kPayloadBits)*sizeof(int8_t));
-        } else {
-            refBits = mxCreateLogicalMatrix(kPayloadBits,1);
-            const mxLogical* src = mxGetLogicals(prhs[14]);
-            const mwSize col = refCols == 1 ? 0 : b;
-            std::memcpy(mxGetLogicals(refBits),src + col*kPayloadBits,
-                        size_t(kPayloadBits)*sizeof(mxLogical));
-        }
-
-        const mxArray* onePrhs[15] = {
-            prhs[0], rxI, rxQ, scale, prhs[4], prhs[5], prhs[6], prhs[7],
-            prhs[8], prhs[9], prhs[10], prhs[11], prhs[12], prhs[13], refBits
-        };
-        mxArray* oneOut[1] = {nullptr};
-        e2eCommand(1,oneOut,15,onePrhs);
-
-        mxArray* f = mxGetField(oneOut[0],0,"BitErrors");
-        bitErrorData[b] = mxGetScalar(f);
-        f = mxGetField(oneOut[0],0,"PacketErrors");
-        packetErrorData[b] = mxGetScalar(f);
-        f = mxGetField(oneOut[0],0,"PayloadChecksum");
-        checksumData[b] = mxGetScalar(f);
-        f = mxGetField(oneOut[0],0,"ReturnedBulkOutputBytes");
-        returnedBytes += mxGetScalar(f);
-
-        totalBitErrors += bitErrorData[b];
-        failedPackets += packetErrorData[b];
-
-        mxDestroyArray(oneOut[0]);
-        mxDestroyArray(refBits);
-        mxDestroyArray(scale);
-        mxDestroyArray(rxQ);
-        mxDestroyArray(rxI);
+    if (nlhs == 1) {
+        // Preserve the original synchronous e2eBatchRun result schema.
+        removeStructField(plhs[0],"BufferCount");
+        removeStructField(plhs[0],"Asynchronous");
+        removeStructField(plhs[0],"BufferIndex");
+        removeStructField(plhs[0],"Ticket");
     }
-
-    mxSetField(out,0,"BatchSize",mxCreateDoubleScalar(double(batchSize)));
-    mxSetField(out,0,"PacketsProcessed",mxCreateDoubleScalar(double(batchSize)));
-    mxSetField(out,0,"TotalBitErrors",mxCreateDoubleScalar(totalBitErrors));
-    mxSetField(out,0,"FailedPackets",mxCreateDoubleScalar(failedPackets));
-    mxSetField(out,0,"Checksums",checksums);
-    mxSetField(out,0,"BitErrorsPerPacket",bitErrors);
-    mxSetField(out,0,"PacketErrorsPerPacket",packetErrors);
-    mxSetField(out,0,"ReturnedBulkOutputBytes",mxCreateDoubleScalar(returnedBytes));
-    mxSetField(out,0,"Pass",mxCreateLogicalScalar(
-        totalBitErrors == 0.0 && failedPackets == 0.0 && returnedBytes == 0.0));
-
-    if (nlhs == 1) plhs[0] = out;
-    else mxDestroyArray(out);
 }
+
 
 void submitCommand(
     int nlhs,mxArray* plhs[],int nrhs,const mxArray* prhs[])
@@ -5167,117 +4506,8 @@ void submitCommand(
 
     CUDA_CHECK(cudaEventRecord(slot->afterH2D,slot->stream));
 
-    CUFFT_CHECK(cufftExecC2C(
-        slot->ltfPlan,slot->dLTFInput,
-        slot->dLTFOutput,CUFFT_FORWARD));
-    CUFFT_CHECK(cufftExecC2C(
-        slot->dataPlan,slot->dDataInput,
-        slot->dDataOutput,CUFFT_FORWARD));
-
-    int threads = 256;
-    int blocks = (kActiveToneCount+threads-1)/threads;
-
-    extractActiveKernel<<<blocks,threads,0,slot->stream>>>(
-        slot->dLTFOutput,slot->dDataOutput,
-        sharedData.ltfFFTIndices,
-        sharedData.dataFFTIndices,
-        slot->dLTFActive,slot->dDataActive);
-    CUDA_CHECK(cudaGetLastError());
-
-    estimateChannelKernel<<<blocks,threads,0,slot->stream>>>(
-        slot->dLTFActive,sharedData.knownLTF,
-        slot->dChannelEstimate);
-    CUDA_CHECK(cudaGetLastError());
-
-    estimatePilotRotationKernel<<<
-        kNumDataSymbols,256,256*sizeof(cufftComplex),
-        slot->stream>>>(
-            slot->dDataActive,slot->dChannelEstimate,
-            sharedData.pilotIndices,
-            sharedData.pilotReference,
-            sharedData.pilotCount,
-            slot->dPilotRotation);
-    CUDA_CHECK(cudaGetLastError());
-
-    blocks = (kActiveToneCount*kNumDataSymbols+
-        threads-1)/threads;
-    equalizeKernel<<<blocks,threads,0,slot->stream>>>(
-        slot->dDataActive,slot->dChannelEstimate,
-        slot->dPilotRotation,float(noiseVariance),
-        slot->dEqualizedActive);
-    CUDA_CHECK(cudaGetLastError());
-
-    segmentQuantizeCSIKernel<<<4,256,0,slot->stream>>>(
-        slot->dEqualizedActive,slot->dChannelEstimate,
-        sharedData.dataIndices,float(noiseVariance),
-        slot->dI,slot->dQ,slot->dCSI,
-        slot->dInverseQuantScales);
-    CUDA_CHECK(cudaGetLastError());
-
-    CUDA_CHECK(cudaEventRecord(
-        slot->afterFrontend,slot->stream));
-
-    blocks = (kTotalSymbols+threads-1)/threads;
-    qam4096DemapKernel<<<blocks,threads,0,slot->stream>>>(
-        slot->dI,slot->dQ,slot->dExternalLLR,kTotalSymbols,
-        slot->dInverseQuantScales,float(1.0/noiseVariance),
-        float(llrScale));
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaEventRecord(slot->afterDemap,slot->stream));
-
-    blocks = (kEncodedLength+threads-1)/threads;
-    mapWeightKernel<<<blocks,threads,0,slot->stream>>>(
-        slot->dExternalLLR,slot->dCSI,
-        sharedData.encodedSourceIndex,
-        float(1.0/llrScale),slot->dEncoded);
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaEventRecord(slot->afterMap,slot->stream));
-
-    dim3 reconBlock(256);
-    dim3 reconGrid(
-        kNumCodewords,(N+reconBlock.x-1)/reconBlock.x);
-
-    reconstructKernel<<<reconGrid,reconBlock,0,slot->stream>>>(
-        slot->dEncoded,sharedData.payloadBits,
-        sharedData.punctureBits,sharedData.repeatBits,
-        slot->dBeliefs,slot->dMessages);
-    CUDA_CHECK(cudaGetLastError());
-
-    layeredNMSKernel<<<kNumCodewords,128,0,slot->stream>>>(
-        slot->dBeliefs,slot->dMessages);
-    CUDA_CHECK(cudaGetLastError());
-
-    dim3 decisionBlock(256);
-    dim3 decisionGrid(
-        kNumCodewords,(K+decisionBlock.x-1)/decisionBlock.x);
-
-    hardDecisionKernel<<<decisionGrid,decisionBlock,0,slot->stream>>>(
-        slot->dBeliefs,sharedData.payloadBits,slot->dDecoded);
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaEventRecord(slot->afterLDPC,slot->stream));
-
-    deriveScramblerSequenceKernel<<<1,1,0,slot->stream>>>(
-        slot->dDecoded,slot->dScrambleSequence,
-        slot->dDescrambleEnabled);
-    CUDA_CHECK(cudaGetLastError());
-
-    blocks = (kPayloadBits+threads-1)/threads;
-    validatePayloadKernel<<<blocks,threads,0,slot->stream>>>(
-        slot->dDecoded,slot->dScrambleSequence,
-        slot->dDescrambleEnabled,validationMode,
-        slot->dReferenceBits,slot->dChecksum,slot->dBitErrors);
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaEventRecord(slot->afterValidate,slot->stream));
-
-    CUDA_CHECK(cudaMemcpyAsync(
-        slot->hChecksum,slot->dChecksum,
-        sizeof(unsigned long long),
-        cudaMemcpyDeviceToHost,slot->stream));
-    CUDA_CHECK(cudaMemcpyAsync(
-        slot->hBitErrors,slot->dBitErrors,
-        sizeof(unsigned int),
-        cudaMemcpyDeviceToHost,slot->stream));
-    CUDA_CHECK(cudaEventRecord(slot->done,slot->stream));
+    launchSinglePacketBackend(
+        *slot,float(noiseVariance),float(llrScale),validationMode);
 
     if (nlhs == 1)
         plhs[0] = mxCreateDoubleScalar(double(slot->ticket));
